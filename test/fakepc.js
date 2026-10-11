@@ -1,6 +1,7 @@
 // A stand-in for Horadric's PC side, to try the relay and the page without
 // a PC: node test/fakepc.js [relay ws url]. It prints a pairing link,
-// answers hello, lists two sessions and echoes what the phone types into
+// answers hello, lists sessions, projects and folders, starts and makes
+// projects, and echoes what the phone types into
 // the watched session's screen.
 'use strict';
 const crypto = require('crypto');
@@ -47,6 +48,43 @@ const projects = [
 ];
 let made = 0;
 
+// The folders the PC's projects live in, as 0.22's folders answer has them.
+const roots = [
+  {
+    path: 'C:\\Users\\me',
+    name: 'me',
+    list: [
+      { path: 'C:\\Users\\me\\horadric.dev', name: 'horadric.dev', git: true },
+      { path: 'C:\\Users\\me\\horadric.portal', name: 'horadric.portal', git: true },
+      { path: 'C:\\Users\\me\\quiet', name: 'quiet', git: false },
+      { path: 'C:\\Users\\me\\forgotten', name: 'forgotten', git: true },
+    ],
+  },
+  {
+    path: 'D:\\Work',
+    name: 'Work',
+    list: [{ path: 'D:\\Work\\client-site', name: 'client-site', git: true }],
+  },
+];
+const known = (path) => roots.some((r) => r.list.some((f) => f.path === path));
+
+// Starts a session in a folder, putting it on the "tiles" first.
+function startSession(path, reply) {
+  const name = path.split('\\').pop();
+  if (!projects.some((x) => x.path === path)) {
+    projects.push({ path, name });
+    broadcast({ t: 'projects', list: projects });
+  }
+  const id = 'n' + ++made;
+  // A real PC takes a moment to start a host.
+  setTimeout(() => {
+    sessions.push({ id, name: `new ${made}`, project: name, phase: 'idle', line: '' });
+    screens[id] = [`New session in ${name}`, '> '];
+    broadcast({ t: 'sessions', list: sessions });
+    reply({ t: 'started', project: path, id });
+  }, 1500);
+}
+
 const sessions = [
   { id: 's1', name: 'relay', project: 'horadric.portal', phase: 'waiting', line: 'Bash: npm test' },
   { id: 's2', name: 'ui', project: 'horadric.dev', phase: 'working', line: 'Editing app.rs' },
@@ -90,16 +128,21 @@ function start() {
       if (s && s.paused) return reply({ t: 'error', text: `${s.name} is paused` });
       sendScreen(f.ch, msg.id);
     } else if (msg.t === 'start') {
-      const p = projects.find((x) => x.path === msg.project);
-      if (!p) return reply({ t: 'error', text: 'No such project' });
-      const id = 'n' + ++made;
-      // A real PC takes a moment to start a host.
-      setTimeout(() => {
-        sessions.push({ id, name: `new ${made}`, project: p.name, phase: 'idle', line: '' });
-        screens[id] = [`New session in ${p.name}`, '> '];
-        broadcast({ t: 'sessions', list: sessions });
-        reply({ t: 'started', project: p.path, id });
-      }, 1500);
+      if (!projects.some((x) => x.path === msg.project) && !known(msg.project)) {
+        return reply({ t: 'error', text: 'No such project' });
+      }
+      startSession(msg.project, reply);
+    } else if (msg.t === 'folders') {
+      reply({ t: 'folders', roots });
+    } else if (msg.t === 'create') {
+      const root = roots.find((r) => r.path === msg.root);
+      const name = String(msg.name || '');
+      if (!root) return reply({ t: 'error', text: 'That is not one of the project folders.' });
+      if (!/^[A-Za-z0-9 ._-]{1,64}$/.test(name) || name.startsWith('.')) return reply({ t: 'error', text: 'That name is not allowed.' });
+      if (root.list.some((f) => f.name.toLowerCase() === name.toLowerCase())) return reply({ t: 'error', text: `${name} exists already.` });
+      const path = `${root.path}\\${name}`;
+      root.list.unshift({ path, name, git: true });
+      startSession(path, reply);
     } else if (msg.t === 'resume') {
       const s = sessions.find((x) => x.id === msg.id);
       if (!s) return reply({ t: 'error', text: 'No such session' });

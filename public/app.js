@@ -92,6 +92,8 @@ const state = {
   backoff: 1000,
   timer: null,
   tooOld: false,
+  view: 'list', // unpaired | list | projects | session
+  folders: null, // the PC's folders answer, null until it comes
 };
 
 function setLink(link) {
@@ -209,6 +211,7 @@ function onMessage(msg) {
       renderTitle();
       renderPush();
       resendPush();
+      if (state.view === 'projects') askFolders();
       break;
     case 'projects':
       state.projects = Array.isArray(msg.list) ? msg.list : [];
@@ -217,7 +220,12 @@ function onMessage(msg) {
     case 'started':
       state.starting = null;
       renderList();
+      renderFolders();
       if (msg.id) watch(msg.id);
+      break;
+    case 'folders':
+      state.folders = Array.isArray(msg.roots) ? msg.roots : [];
+      renderFolders();
       break;
     case 'sessions':
       state.sessions = Array.isArray(msg.list) ? msg.list : [];
@@ -240,9 +248,9 @@ function onMessage(msg) {
       if (state.starting) {
         state.starting = null;
         renderList();
+        renderFolders();
       }
-      $('note').hidden = false;
-      $('note').textContent = msg.text || 'The PC reported an error.';
+      say(msg.text || 'The PC reported an error.');
       break;
   }
 }
@@ -266,6 +274,8 @@ function renderTitle() {
   if (state.watching) {
     const s = state.sessions.find((x) => x.id === state.watching);
     $('title').textContent = s ? s.name : 'Session';
+  } else if (state.view === 'projects') {
+    $('title').textContent = 'Open project';
   } else {
     $('title').textContent = state.pc ? state.pc.n : 'Horadric';
   }
@@ -374,19 +384,124 @@ function renderList() {
 
 // Starting and resuming
 
-function startIn(path) {
+// A note on whichever view is up, so an error is seen where it happened.
+function say(text) {
+  const note = state.view === 'projects' ? $('pnote') : $('note');
+  note.hidden = false;
+  note.textContent = text;
+}
+
+// `ask` is the message that starts it: start in a known folder, or
+// create a new one. `path` only marks where the spinner goes.
+function startIn(path, ask = { t: 'start', project: path }) {
   const at = Date.now();
   state.starting = { project: path, at };
+  $('pnote').hidden = true;
   renderList();
-  send({ t: 'start', project: path });
+  renderFolders();
+  send(ask);
   // A PC that never answers must not leave the spinner forever.
   setTimeout(() => {
     if (!state.starting || state.starting.at !== at) return;
     state.starting = null;
     renderList();
-    $('note').hidden = false;
-    $('note').textContent = 'The PC did not start the session. Is its Horadric up to date?';
+    renderFolders();
+    say('The PC did not start the session. Is its Horadric up to date?');
   }, 30000);
+}
+
+// Opening any project: the folders the PC's projects live in, so one
+// that was not open on the PC can still be worked on.
+
+function askFolders() {
+  const at = Date.now();
+  askFolders.at = at;
+  send({ t: 'folders' });
+  setTimeout(() => {
+    if (askFolders.at !== at || state.folders || state.view !== 'projects') return;
+    say('The PC did not list its projects. Opening projects needs Horadric 0.22 or later on the PC.');
+  }, 8000);
+}
+
+function openProjects() {
+  $('pnote').hidden = true;
+  show('projects');
+  history.pushState({ projects: true }, '');
+  renderTitle();
+  renderFolders();
+  askFolders();
+}
+
+const sepOf = (root) => (String(root).includes('\\') ? '\\' : '/');
+
+// The spec's rule for a new folder's name, so a typo is caught before the
+// PC has to refuse it.
+function nameProblem(name, root) {
+  if (!name) return 'Give it a name.';
+  if (name.length > 64) return 'At most 64 characters.';
+  if (!/^[A-Za-z0-9 ._-]+$/.test(name)) return 'Letters, digits, space, dot, dash and underscore only.';
+  if (name.startsWith('.')) return 'It cannot start with a dot.';
+  const r = (state.folders || []).find((x) => x.path === root);
+  const lower = name.toLowerCase();
+  if (r && (r.list || []).some((f) => String(f.name).toLowerCase() === lower)) return 'That folder exists. Open it from the list instead.';
+  return '';
+}
+
+function renderFolders() {
+  const roots = state.folders || [];
+  const sel = $('root');
+  const keep = sel.value;
+  sel.replaceChildren(
+    ...roots.map((r) => {
+      const o = document.createElement('option');
+      o.value = r.path;
+      o.textContent = r.name || baseName(r.path);
+      return o;
+    }),
+  );
+  if (roots.some((r) => r.path === keep)) sel.value = keep;
+  $('newproject').disabled = !roots.length;
+
+  if (!state.folders) {
+    const wait = el('div', 'dim center', state.link === 'online' ? 'Asking the PC for its projects...' : 'Waiting for the PC...');
+    $('folders').replaceChildren(wait);
+    return;
+  }
+  const q = $('search').value.trim().toLowerCase();
+  const busy = !!state.starting || state.link !== 'online';
+  const out = [];
+  for (const r of roots) {
+    const list = (r.list || []).filter((f) => !q || String(f.name).toLowerCase().includes(q));
+    const creating =
+      state.starting && state.starting.root === r.path && !list.some((f) => f.path === state.starting.project);
+    if (q && !list.length && !creating) continue;
+    const sec = el('section', 'group root');
+    sec.append(el('h2', null, r.name || baseName(r.path)), el('div', 'rpath', r.path));
+    if (creating) {
+      const row = el('div', 'sess starting');
+      row.append(el('i', 'spinner'), el('div', 'what', 'Making the project...'));
+      sec.append(row);
+    }
+    for (const f of list) {
+      const here = state.starting && state.starting.project === f.path;
+      const row = el('div', 'sess folder' + (here ? ' starting' : ''));
+      row.setAttribute('role', 'button');
+      row.tabIndex = 0;
+      const what = el('div', 'what');
+      what.append(el('div', 'name', f.name || baseName(f.path)));
+      if (here) what.append(el('div', 'line', 'Starting a session...'));
+      row.append(here ? el('i', 'spinner') : el('i', 'lamp'), what);
+      if (f.git) row.append(el('span', 'git', 'git'));
+      row.onclick = () => {
+        if (!busy) startIn(f.path);
+      };
+      sec.append(row);
+    }
+    if (!list.length && !creating) sec.append(el('div', 'dim none', 'No folders'));
+    out.push(sec);
+  }
+  if (!out.length) out.push(el('div', 'dim center', q ? 'No project matches.' : 'The PC knows no project folders yet.'));
+  $('folders').replaceChildren(...out);
 }
 
 function resume(id) {
@@ -490,13 +605,16 @@ function renderScreen() {
 // Navigation
 
 function show(view) {
-  for (const v of ['unpaired', 'list', 'session']) $(v).hidden = v !== view;
-  $('back').hidden = view !== 'session';
+  state.view = view;
+  for (const v of ['unpaired', 'list', 'projects', 'session']) $(v).hidden = v !== view;
+  $('back').hidden = view !== 'session' && view !== 'projects';
 }
 
 function watch(id) {
   const again = state.watching === id;
-  const swap = state.watching && !again;
+  // A session started from the projects view takes that view's place in
+  // history, so back goes to the session list.
+  const swap = (state.watching && !again) || state.view === 'projects';
   state.watching = id;
   state.screen = null;
   state.paused = false;
@@ -528,6 +646,7 @@ function choose(pc) {
   state.starting = null;
   state.watching = null;
   state.tooOld = false;
+  state.folders = null;
   if (pc) localStorage.setItem('horadric.current', pc.id);
   renderPcs();
   renderTitle();
@@ -588,7 +707,41 @@ $('text').addEventListener('input', () => {
 });
 
 $('back').onclick = () => history.back();
-window.addEventListener('popstate', () => unwatch());
+window.addEventListener('popstate', () => {
+  if (state.watching) return unwatch();
+  if (state.view === 'projects') {
+    show('list');
+    renderTitle();
+  }
+});
+
+$('openproject').onclick = openProjects;
+$('search').addEventListener('input', renderFolders);
+$('newproject').onclick = () => {
+  $('create').hidden = !$('create').hidden;
+  if (!$('create').hidden) $('pname').focus();
+};
+$('pname').addEventListener('input', () => {
+  $('createhint').className = 'dim';
+  $('createhint').textContent = '';
+});
+$('create').onsubmit = (ev) => {
+  ev.preventDefault();
+  const root = $('root').value;
+  const name = $('pname').value.trim();
+  const problem = root ? nameProblem(name, root) : 'The PC listed no place to make it in.';
+  if (problem) {
+    $('createhint').className = 'dim bad';
+    $('createhint').textContent = problem;
+    return;
+  }
+  if (state.starting || state.link !== 'online') return;
+  $('pname').value = '';
+  $('create').hidden = true;
+  startIn(root + sepOf(root) + name, { t: 'create', root, name });
+  state.starting.root = root;
+  renderFolders();
+};
 
 $('pcs').onchange = () => choose(loadPcs().find((p) => p.id === $('pcs').value) || null);
 

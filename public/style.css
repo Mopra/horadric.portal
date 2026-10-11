@@ -275,3 +275,37 @@ code { font-family: ui-monospace, "Cascadia Mono", Menlo, monospace; color: var(
 }
 @keyframes spin { to { transform: rotate(360deg); } }
 .foot .pill { display: block; margin: 0 auto 12px; }
+
+/* 0.22: opening any project, making new ones */
+.tools { display: flex; gap: 8px; margin: 12px 12px 0; }
+.tools .pill { margin: 0; }
+#list .tools { justify-content: flex-end; }
+#search, .create input, .create select {
+  flex: 1;
+  min-width: 0;
+  padding: 10px 12px;
+  border-radius: 8px;
+  border: 1px solid var(--line);
+  background: var(--well);
+  color: inherit;
+  font-size: 16px;
+}
+.create {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin: 12px 12px 0;
+  padding: 12px;
+  border-radius: 10px;
+  background: var(--plate);
+  border: 1px solid var(--line);
+}
+.create select { flex-basis: 70%; }
+.create input { flex-basis: 100%; }
+.create .pill { margin: 0; }
+#createhint { flex-basis: 100%; margin: 0; font-size: 13px; }
+#createhint.bad { color: var(--error); }
+.root .rpath { margin: -2px 0 6px 4px; font-size: 11px; color: var(--legend); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.folder { padding: 10px 12px; }
+.folder .git { flex: none; font-size: 11px; color: var(--done); border: 1px solid rgba(61, 214, 140, 0.4); border-radius: 4px; padding: 1px 5px; }

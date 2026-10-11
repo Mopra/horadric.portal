@@ -41,6 +41,7 @@
 
 <main id="list" class="view" hidden>
   <div id="note" class="note" hidden></div>
+  <div class="tools"><button id="openproject" class="pill">Open project</button></div>
   <div id="groups"></div>
   <div id="empty" class="dim center" hidden>No sessions on this PC.</div>
   <footer class="foot">
@@ -49,6 +50,22 @@
     <button id="copylink" class="link">Copy pairing link</button>
     <button id="forget" class="link">Forget this PC</button>
   </footer>
+</main>
+
+<main id="projects" class="view" hidden>
+  <div class="tools">
+    <input id="search" type="search" placeholder="Search projects" autocomplete="off" autocapitalize="off" spellcheck="false">
+    <button id="newproject" class="pill">New project</button>
+  </div>
+  <form id="create" class="create" hidden>
+    <label class="dim" for="root">In</label>
+    <select id="root"></select>
+    <input id="pname" placeholder="Folder name" autocomplete="off" autocapitalize="off" spellcheck="false" maxlength="64">
+    <button type="submit" class="pill">Create and start</button>
+    <p id="createhint" class="dim"></p>
+  </form>
+  <div id="pnote" class="note" hidden></div>
+  <div id="folders"></div>
 </main>
 
 <main id="session" class="view" hidden>
