@@ -584,19 +584,41 @@ async function resendPush() {
   } catch {}
 }
 
-let zoom = Number(localStorage.getItem('horadric.zoom')) || 0;
+let zoom = Number(localStorage.getItem('horadric.textzoom')) || 0;
+
+// A PC terminal is 150 columns or more and a phone fits about 45 readable
+// ones. Shrinking the PC's width to the phone made text too small to read,
+// so the phone keeps a readable size and wraps instead. Rules and the gaps
+// that right align a status line are drawn for the PC's width, and wrapped
+// they turn into rows of dashes, so they are cut to the phone's first.
+const RULE = /[─━═╌┄┈\-]{4,}/g;
+function fitLine(line, cols) {
+  if ([...line].length <= cols) return line;
+  if (/^[─━═╌┄┈\-\s]+$/.test(line)) return line.trim().slice(0, cols);
+  let out = line.replace(RULE, (run) => run.slice(0, 3));
+  if ([...out].length > cols) out = out.replace(/(\S) {3,}(?=\S)/g, '$1  ');
+  return out;
+}
+
+// The width of one monospace cell at the screen's font size.
+function cellWidth(pre) {
+  const ctx = (cellWidth.canvas ||= document.createElement('canvas')).getContext('2d');
+  const style = getComputedStyle(pre);
+  ctx.font = `${style.fontSize} ${style.fontFamily}`;
+  return ctx.measureText('M'.repeat(20)).width / 20 || 8;
+}
 
 function renderScreen() {
   const sc = state.screen;
   const pre = $('screen');
   const wrap = $('screenwrap');
   const atBottom = wrap.scrollHeight - wrap.scrollTop - wrap.clientHeight < 40;
-  const cols = sc && sc.cols ? sc.cols : 80;
-  // Fit the PC's columns to the phone's width, then let the human zoom.
-  const fit = (wrap.clientWidth - 12) / (cols * 0.6);
-  const size = Math.max(5, Math.min(16, fit + zoom));
-  pre.style.fontSize = size.toFixed(2) + 'px';
-  pre.textContent = sc ? (sc.lines || []).join('\n') : state.paused ? 'This session is paused.' : 'Waiting for the screen...';
+  const size = Math.max(9, Math.min(22, 13 + zoom));
+  pre.style.fontSize = size + 'px';
+  const cols = Math.max(20, Math.floor((pre.clientWidth - 12) / cellWidth(pre)));
+  pre.textContent = sc
+    ? (sc.lines || []).map((l) => fitLine(l, cols)).join('\n')
+    : state.paused ? 'This session is paused.' : 'Waiting for the screen...';
   $('resumebar').hidden = !state.paused;
   if (atBottom || !renderScreen.seen) wrap.scrollTop = wrap.scrollHeight;
   renderScreen.seen = true;
@@ -674,12 +696,12 @@ $('keys').addEventListener('click', (ev) => {
 
 $('zoomin').onclick = () => {
   zoom += 1;
-  localStorage.setItem('horadric.zoom', zoom);
+  localStorage.setItem('horadric.textzoom', zoom);
   renderScreen();
 };
 $('zoomout').onclick = () => {
   zoom -= 1;
-  localStorage.setItem('horadric.zoom', zoom);
+  localStorage.setItem('horadric.textzoom', zoom);
   renderScreen();
 };
 
