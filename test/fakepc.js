@@ -33,10 +33,24 @@ function open(buf) {
   return JSON.parse(Buffer.concat([d.update(buf.subarray(12, buf.length - 16)), d.final()]).toString('utf8'));
 }
 
+// The VAPID key pair a real PC keeps in portal.json, made fresh here.
+const vapid = crypto.generateKeyPairSync('ec', { namedCurve: 'P-256' });
+const vapidJwk = vapid.publicKey.export({ format: 'jwk' });
+const vapidRaw = Buffer.concat([Buffer.from([4]), Buffer.from(vapidJwk.x, 'base64url'), Buffer.from(vapidJwk.y, 'base64url')]).toString('base64url');
+const subs = new Map(); // endpoint -> subscription
+
+// Sessions name their project by name, as the real PC does.
+const projects = [
+  { path: 'C:\\Users\\me\\horadric.dev', name: 'horadric.dev' },
+  { path: 'C:\\Users\\me\\horadric.portal', name: 'horadric.portal' },
+  { path: 'C:\\Users\\me\\quiet', name: 'quiet' },
+];
+let made = 0;
+
 const sessions = [
-  { id: 's1', name: 'relay', project: 'C:\\Users\\me\\horadric.portal', phase: 'waiting', line: 'Bash: npm test' },
-  { id: 's2', name: 'ui', project: 'C:\\Users\\me\\horadric.dev', phase: 'working', line: 'Editing app.rs' },
-  { id: 's3', name: 'docs', project: 'C:\\Users\\me\\horadric.dev', phase: 'idle', line: '' },
+  { id: 's1', name: 'relay', project: 'horadric.portal', phase: 'waiting', line: 'Bash: npm test' },
+  { id: 's2', name: 'ui', project: 'horadric.dev', phase: 'working', line: 'Editing app.rs' },
+  { id: 's3', name: 'docs', project: 'horadric.dev', phase: 'idle', line: '', paused: true },
 ];
 const screens = {};
 for (const s of sessions) {
@@ -51,6 +65,8 @@ function start() {
   ws.on('message', (data, isBinary) => {
     if (!isBinary) {
       const m = JSON.parse(data.toString());
+      heard = Date.now();
+      if (m.pong) return;
       console.log('relay:', m);
       if (m.close) watching.delete(m.close);
       return;
@@ -65,11 +81,38 @@ function start() {
     console.log('ch', f.ch, msg);
     const reply = (obj) => ws.send(R.frame(f.ch, seal(obj)));
     if (msg.t === 'hello') {
-      reply({ t: 'hello', v: 1, pc: name });
+      reply({ t: 'hello', v: 1, pc: name, vapid: vapidRaw });
       reply({ t: 'sessions', list: sessions });
+      reply({ t: 'projects', list: projects });
     } else if (msg.t === 'watch') {
       watching.set(f.ch, msg.id);
+      const s = sessions.find((x) => x.id === msg.id);
+      if (s && s.paused) return reply({ t: 'error', text: `${s.name} is paused` });
       sendScreen(f.ch, msg.id);
+    } else if (msg.t === 'start') {
+      const p = projects.find((x) => x.path === msg.project);
+      if (!p) return reply({ t: 'error', text: 'No such project' });
+      const id = 'n' + ++made;
+      // A real PC takes a moment to start a host.
+      setTimeout(() => {
+        sessions.push({ id, name: `new ${made}`, project: p.name, phase: 'idle', line: '' });
+        screens[id] = [`New session in ${p.name}`, '> '];
+        broadcast({ t: 'sessions', list: sessions });
+        reply({ t: 'started', project: p.path, id });
+      }, 1500);
+    } else if (msg.t === 'resume') {
+      const s = sessions.find((x) => x.id === msg.id);
+      if (!s) return reply({ t: 'error', text: 'No such session' });
+      setTimeout(() => {
+        s.paused = false;
+        broadcast({ t: 'sessions', list: sessions });
+        for (const [ch, sid] of watching) if (sid === s.id) sendScreen(ch, sid);
+      }, 1000);
+    } else if (msg.t === 'push') {
+      subs.set(msg.sub.endpoint, msg.sub);
+      console.log('push subscription', msg.sub.endpoint.slice(0, 60));
+    } else if (msg.t === 'unpush') {
+      subs.delete(msg.endpoint);
     } else if (msg.t === 'unwatch') {
       watching.delete(f.ch);
     } else if (msg.t === 'input') {
@@ -88,6 +131,37 @@ function start() {
   ws.on('error', (e) => console.log('error', e.message));
 }
 
+function broadcast(obj) {
+  if (ws && ws.readyState === 1) ws.send(R.frame(R.BROADCAST, seal(obj)));
+}
+
+// Liveness, as docs/PORTAL.md asks of a PC.
+let heard = Date.now();
+setInterval(() => {
+  if (!ws || ws.readyState !== 1) return;
+  if (Date.now() - heard > 70000) return ws.terminate();
+  ws.send('{"ping":1}');
+}, 25000).unref();
+
+// A push with no body, signed with VAPID, the way the PC sends one.
+function vapidJwt(endpoint) {
+  const enc = (o) => Buffer.from(JSON.stringify(o)).toString('base64url');
+  const head = enc({ typ: 'JWT', alg: 'ES256' });
+  const body = enc({ aud: new URL(endpoint).origin, exp: Math.floor(Date.now() / 1000) + 12 * 3600, sub: 'mailto:portal@horadric.dev' });
+  const sig = crypto.sign('sha256', Buffer.from(`${head}.${body}`), { key: vapid.privateKey, dsaEncoding: 'ieee-p1363' });
+  return `${head}.${body}.${sig.toString('base64url')}`;
+}
+async function push() {
+  for (const sub of subs.values()) {
+    const res = await fetch(sub.endpoint, {
+      method: 'POST',
+      headers: { TTL: '3600', Urgency: 'high', Authorization: `vapid t=${vapidJwt(sub.endpoint)}, k=${vapidRaw}` },
+    }).catch((e) => ({ status: 'error ' + e.message }));
+    console.log('push', res.status, sub.endpoint.slice(0, 50));
+    if (res.status === 404 || res.status === 410) subs.delete(sub.endpoint);
+  }
+}
+
 function sendScreen(ch, sid) {
   const lines = screens[sid];
   if (!lines) return ws.send(R.frame(ch, seal({ t: 'error', text: 'No such session' })));
@@ -97,7 +171,11 @@ function sendScreen(ch, sid) {
 // Phases change now and then, as on a real PC.
 setInterval(() => {
   sessions[1].phase = sessions[1].phase === 'working' ? 'waiting' : 'working';
-  if (ws && ws.readyState === 1) ws.send(R.frame(R.BROADCAST, seal({ t: 'sessions', list: sessions })));
+  broadcast({ t: 'sessions', list: sessions });
 }, 5000).unref();
+
+// A push every 20 seconds while a phone is subscribed, to try its
+// notification. FAKE_PUSH=0 turns it off.
+if (process.env.FAKE_PUSH !== '0') setInterval(() => subs.size && push(), 20000).unref();
 
 start();

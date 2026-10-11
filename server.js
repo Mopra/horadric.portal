@@ -114,7 +114,7 @@ function onPc(ws, id) {
     sendText(ws, { open: ch });
   }
   ws.on('message', (data, isBinary) => {
-    if (!isBinary) return;
+    if (!isBinary) return R.isPing(data) && sendText(ws, { pong: 1 });
     const f = R.unframe(data);
     if (!f) return;
     if (f.ch === R.BROADCAST) {
@@ -143,7 +143,8 @@ function onPhone(ws, id) {
   sendText(ws, { relay: r.pc ? 'online' : 'offline' });
   if (r.pc) sendText(r.pc, { open: ch });
   ws.on('message', (data, isBinary) => {
-    if (!isBinary || !r.pc || r.pc.readyState !== 1) return;
+    if (!isBinary) return R.isPing(data) && sendText(ws, { pong: 1 });
+    if (!r.pc || r.pc.readyState !== 1) return;
     r.pc.send(R.frame(ch, data));
   });
   ws.on('close', () => {

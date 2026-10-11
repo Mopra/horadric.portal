@@ -38,12 +38,15 @@
   <div id="groups"></div>
   <div id="empty" class="dim center" hidden>No sessions on this PC.</div>
   <footer class="foot">
+    <button id="notify" class="pill" hidden>Notify me when a session waits</button>
+    <p id="notifyhint" class="dim" hidden></p>
     <button id="forget" class="link">Forget this PC</button>
   </footer>
 </main>
 
 <main id="session" class="view" hidden>
   <div id="screenwrap"><pre id="screen"></pre></div>
+  <div id="resumebar" hidden><span>Paused on the PC.</span><button id="resume" class="pill">Resume</button></div>
   <div id="keys">
     <button data-k="&#13;">Enter</button>
     <button data-k="&#27;">Esc</button>

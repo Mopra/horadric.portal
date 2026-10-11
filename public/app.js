@@ -70,6 +70,11 @@ const state = {
   link: 'connecting', // connecting | offline (relay down) | pcoff | online
   pcName: '',
   sessions: [],
+  projects: [],
+  vapid: null,
+  starting: null, // { project, at }
+  paused: false, // the watched session answered watch with paused
+  heard: 0, // when the relay last said anything, ms
   watching: null,
   screen: null,
   backoff: 1000,
@@ -111,8 +116,10 @@ async function connect() {
   state.ws = ws;
   ws.onopen = () => {
     state.backoff = 1000;
+    state.heard = Date.now();
   };
   ws.onmessage = async (ev) => {
+    state.heard = Date.now();
     if (typeof ev.data === 'string') {
       let msg;
       try {
@@ -120,6 +127,7 @@ async function connect() {
       } catch {
         return;
       }
+      if (msg.pong) return;
       if (msg.relay === 'online') {
         setLink('online');
         send({ t: 'hello', v: VERSION });
@@ -146,6 +154,27 @@ async function connect() {
   };
 }
 
+// A socket can look open long after the network under it died, most of
+// all on a phone that slept. A ping every 25 seconds, and a reconnect
+// after 70 seconds of silence, find that out.
+const PING_MS = 25000;
+const SILENCE_MS = 70000;
+setInterval(() => {
+  const ws = state.ws;
+  if (!ws || ws.readyState !== 1) return;
+  if (Date.now() - state.heard > SILENCE_MS) return connect();
+  ws.send('{"ping":1}');
+}, PING_MS);
+
+// Back in front, or back on a network: a socket from before is likely
+// dead, so check at once instead of waiting for the next ping.
+function wake() {
+  if (!state.pc) return;
+  const ws = state.ws;
+  if (!ws || ws.readyState !== 1 || Date.now() - state.heard > PING_MS) connect();
+  else ws.send('{"ping":1}');
+}
+
 async function send(obj) {
   const ws = state.ws;
   if (!ws || ws.readyState !== 1 || !state.key) return false;
@@ -163,8 +192,20 @@ function onMessage(msg) {
         savePcs(loadPcs().map((p) => (p.id === state.pc.id ? state.pc : p)));
         renderPcs();
       }
+      state.vapid = typeof msg.vapid === 'string' ? msg.vapid : null;
       renderNote();
       renderTitle();
+      renderPush();
+      resendPush();
+      break;
+    case 'projects':
+      state.projects = Array.isArray(msg.list) ? msg.list : [];
+      renderList();
+      break;
+    case 'started':
+      state.starting = null;
+      renderList();
+      if (msg.id) watch(msg.id);
       break;
     case 'sessions':
       state.sessions = Array.isArray(msg.list) ? msg.list : [];
@@ -173,11 +214,21 @@ function onMessage(msg) {
       break;
     case 'screen':
       if (msg.id === state.watching) {
+        state.paused = false;
         state.screen = msg;
         renderScreen();
       }
       break;
     case 'error':
+      if (state.watching && /paused/i.test(msg.text || '')) {
+        state.paused = true;
+        renderScreen();
+        break;
+      }
+      if (state.starting) {
+        state.starting = null;
+        renderList();
+      }
       $('note').hidden = false;
       $('note').textContent = msg.text || 'The PC reported an error.';
       break;
@@ -223,47 +274,187 @@ function renderPcs() {
   );
 }
 
-function renderList() {
+const baseName = (p) => String(p).split(/[\\/]/).filter(Boolean).pop() || String(p);
+
+// Every project the PC knows, each with its sessions, so a project with
+// none can still get one. A session names its project by name or path.
+function grouped() {
   const groups = new Map();
-  for (const s of state.sessions) {
-    const key = s.project || 'Other';
-    if (!groups.has(key)) groups.set(key, []);
-    groups.get(key).push(s);
+  const keyOf = new Map();
+  for (const p of state.projects) {
+    if (!p || !p.path) continue;
+    groups.set(p.path, { path: p.path, name: p.name || baseName(p.path), list: [] });
+    keyOf.set(p.path, p.path);
+    if (p.name && !keyOf.has(p.name)) keyOf.set(p.name, p.path);
   }
-  const rank = (s) => ({ waiting: 0, working: 1, idle: 2, ended: 3 })[phaseOf(s)];
-  const sorted = [...groups.entries()]
-    .map(([project, list]) => [project, list.sort((a, b) => rank(a) - rank(b) || String(a.name).localeCompare(b.name))])
-    .sort((a, b) => rank(a[1][0]) - rank(b[1][0]) || a[0].localeCompare(b[0]));
+  for (const s of state.sessions) {
+    const raw = s.project || 'Other';
+    const key = keyOf.get(raw) || raw;
+    if (!groups.has(key)) groups.set(key, { path: null, name: baseName(raw), list: [] });
+    groups.get(key).list.push(s);
+  }
+  const rank = (s) => (s.paused ? 2.5 : { waiting: 0, working: 1, idle: 2, ended: 3 }[phaseOf(s)]);
+  const best = (g) => (g.list.length ? Math.min(...g.list.map(rank)) : 9);
+  const order = state.projects.map((p) => p && p.path);
+  for (const g of groups.values()) g.list.sort((a, b) => rank(a) - rank(b) || String(a.name).localeCompare(b.name));
+  return [...groups.values()].sort((a, b) => {
+    const r = best(a) - best(b);
+    if (r) return r;
+    const ia = order.indexOf(a.path);
+    const ib = order.indexOf(b.path);
+    if (ia >= 0 && ib >= 0) return ia - ib;
+    return a.name.localeCompare(b.name);
+  });
+}
+
+function el(tag, cls, text) {
+  const e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (text != null) e.textContent = text;
+  return e;
+}
+
+function renderList() {
   const out = [];
-  for (const [project, list] of sorted) {
-    const g = document.createElement('section');
-    g.className = 'group';
-    const h = document.createElement('h2');
-    h.textContent = project.split(/[\\/]/).filter(Boolean).pop() || project;
-    g.append(h);
-    for (const s of list) {
-      const b = document.createElement('button');
-      const ph = phaseOf(s);
-      b.className = 'sess ' + ph;
-      const lamp = document.createElement('i');
-      lamp.className = 'lamp ' + ph;
-      const what = document.createElement('div');
-      what.className = 'what';
-      const name = document.createElement('div');
-      name.className = 'name';
-      name.textContent = s.name || s.id;
-      const line = document.createElement('div');
-      line.className = 'line';
-      line.textContent = s.line || ph;
-      what.append(name, line);
-      b.append(lamp, what);
-      b.onclick = () => watch(s.id);
-      g.append(b);
+  for (const g of grouped()) {
+    const sec = el('section', 'group');
+    const head = el('div', 'ghead');
+    head.append(el('h2', null, g.name));
+    if (g.path) {
+      const plus = el('button', 'plus', '+');
+      plus.setAttribute('aria-label', `New session in ${g.name}`);
+      plus.disabled = !!state.starting || state.link !== 'online';
+      plus.onclick = () => startIn(g.path);
+      head.append(plus);
     }
-    out.push(g);
+    sec.append(head);
+    const startingHere = state.starting && state.starting.project === g.path;
+    if (startingHere) {
+      const row = el('div', 'sess starting');
+      row.append(el('i', 'spinner'), el('div', 'what', 'Starting a session...'));
+      sec.append(row);
+    }
+    for (const s of g.list) {
+      const ph = phaseOf(s);
+      const b = el('div', 'sess ' + ph + (s.paused ? ' paused' : ''));
+      b.setAttribute('role', 'button');
+      b.tabIndex = 0;
+      const what = el('div', 'what');
+      what.append(el('div', 'name', s.name || s.id), el('div', 'line', s.paused ? 'paused' : s.line || ph));
+      b.append(el('i', 'lamp ' + (s.paused ? 'paused' : ph)), what);
+      if (s.paused) {
+        const r = el('button', 'resume', 'Resume');
+        r.onclick = (ev) => {
+          ev.stopPropagation();
+          resume(s.id);
+        };
+        b.append(r);
+      }
+      b.onclick = () => watch(s.id);
+      sec.append(b);
+    }
+    if (!g.list.length && !startingHere) sec.append(el('div', 'dim none', 'No sessions'));
+    out.push(sec);
   }
   $('groups').replaceChildren(...out);
-  $('empty').hidden = state.sessions.length > 0 || state.link !== 'online';
+  $('empty').hidden = out.length > 0 || state.link !== 'online';
+}
+
+// Starting and resuming
+
+function startIn(path) {
+  const at = Date.now();
+  state.starting = { project: path, at };
+  renderList();
+  send({ t: 'start', project: path });
+  // A PC that never answers must not leave the spinner forever.
+  setTimeout(() => {
+    if (!state.starting || state.starting.at !== at) return;
+    state.starting = null;
+    renderList();
+    $('note').hidden = false;
+    $('note').textContent = 'The PC did not start the session. Is its Horadric up to date?';
+  }, 30000);
+}
+
+function resume(id) {
+  send({ t: 'resume', id });
+  watch(id);
+}
+
+// Push
+
+function pushSupport() {
+  if (!('serviceWorker' in navigator)) return 'This browser cannot notify.';
+  if (!('PushManager' in window) || !('Notification' in window)) {
+    const ios = /iP(hone|ad|od)/.test(navigator.userAgent);
+    const installed = matchMedia('(display-mode: standalone)').matches || navigator.standalone;
+    if (ios && !installed) return 'For notifications, tap Share, then Add to Home Screen, and open Horadric from there.';
+    return 'This browser cannot notify.';
+  }
+  return null;
+}
+
+function renderPush() {
+  const b = $('notify');
+  const hint = $('notifyhint');
+  const why = state.vapid ? pushSupport() : null;
+  let text = why;
+  let button = !!state.vapid && !why;
+  if (button && Notification.permission === 'denied') {
+    button = false;
+    text = 'Notifications are blocked for this page in the browser settings.';
+  } else if (button && Notification.permission === 'granted' && localStorage.getItem('horadric.push.' + state.pc.id) === state.vapid) {
+    button = false;
+    text = 'You get a notification when a session waits.';
+  }
+  b.hidden = !button;
+  hint.hidden = !text;
+  hint.textContent = text || '';
+}
+
+async function subscription(create) {
+  const reg = await navigator.serviceWorker.ready;
+  let sub = await reg.pushManager.getSubscription();
+  const want = b64url(state.vapid);
+  if (sub && sub.options && sub.options.applicationServerKey) {
+    const have = new Uint8Array(sub.options.applicationServerKey);
+    if (have.length !== want.length || have.some((x, i) => x !== want[i])) {
+      // Subscribed for another PC's key. A page holds one subscription, so
+      // it moves to the PC in front, and only when the human asks.
+      if (!create) return null;
+      await sub.unsubscribe();
+      sub = null;
+    }
+  }
+  if (!sub && create) sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: want });
+  return sub;
+}
+
+async function enablePush() {
+  try {
+    if ((await Notification.requestPermission()) === 'granted') {
+      const sub = await subscription(true);
+      if (sub && (await send({ t: 'push', sub: sub.toJSON() }))) {
+        localStorage.setItem('horadric.push.' + state.pc.id, state.vapid);
+      }
+    }
+    renderPush();
+  } catch (e) {
+    renderPush();
+    $('notifyhint').hidden = false;
+    $('notifyhint').textContent = 'Could not turn notifications on: ' + (e && e.message ? e.message : e);
+  }
+}
+
+// The PC dedupes, so sending the subscription on every hello costs little
+// and heals a PC that lost it (a rekey, a new install).
+async function resendPush() {
+  if (!state.vapid || pushSupport() || Notification.permission !== 'granted') return;
+  try {
+    const sub = await subscription(false);
+    if (sub) send({ t: 'push', sub: sub.toJSON() });
+  } catch {}
 }
 
 let zoom = Number(localStorage.getItem('horadric.zoom')) || 0;
@@ -278,7 +469,8 @@ function renderScreen() {
   const fit = (wrap.clientWidth - 12) / (cols * 0.6);
   const size = Math.max(5, Math.min(16, fit + zoom));
   pre.style.fontSize = size.toFixed(2) + 'px';
-  pre.textContent = sc ? (sc.lines || []).join('\n') : 'Waiting for the screen...';
+  pre.textContent = sc ? (sc.lines || []).join('\n') : state.paused ? 'This session is paused.' : 'Waiting for the screen...';
+  $('resumebar').hidden = !state.paused;
   if (atBottom || !renderScreen.seen) wrap.scrollTop = wrap.scrollHeight;
   renderScreen.seen = true;
 }
@@ -291,19 +483,25 @@ function show(view) {
 }
 
 function watch(id) {
+  const again = state.watching === id;
+  const swap = state.watching && !again;
   state.watching = id;
   state.screen = null;
+  state.paused = false;
   renderScreen.seen = false;
   show('session');
   renderTitle();
   renderScreen();
   send({ t: 'watch', id });
-  history.pushState({ session: id }, '');
+  // One history entry for the session view, whichever session it shows.
+  if (swap) history.replaceState({ session: id }, '');
+  else if (!again) history.pushState({ session: id }, '');
 }
 
 function unwatch() {
   if (!state.watching) return;
   state.watching = null;
+  state.paused = false;
   state.screen = null;
   send({ t: 'unwatch' });
   show('list');
@@ -313,6 +511,9 @@ function unwatch() {
 function choose(pc) {
   state.pc = pc;
   state.sessions = [];
+  state.projects = [];
+  state.vapid = null;
+  state.starting = null;
   state.watching = null;
   state.tooOld = false;
   if (pc) localStorage.setItem('horadric.current', pc.id);
@@ -387,8 +588,11 @@ $('forget').onclick = () => {
 };
 
 document.addEventListener('visibilitychange', () => {
-  if (document.visibilityState === 'visible' && state.pc && !state.ws) connect();
+  if (document.visibilityState === 'visible') wake();
 });
+window.addEventListener('online', wake);
+$('notify').onclick = enablePush;
+$('resume').onclick = () => state.watching && resume(state.watching);
 window.addEventListener('resize', () => state.watching && renderScreen());
 
 // Start

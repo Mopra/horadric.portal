@@ -1,6 +1,6 @@
 // Keeps the page openable without a network, and always prefers a fresh
 // copy when there is one, so an update reaches the phone at once.
-const CACHE = 'horadric-portal-v1';
+const CACHE = 'horadric-portal-v2';
 const SHELL = ['/', '/index.html', '/app.js', '/style.css', '/manifest.webmanifest', '/icon.png', '/icon-256.png'];
 
 self.addEventListener('install', (ev) => {
@@ -27,5 +27,29 @@ self.addEventListener('fetch', (ev) => {
         return res;
       })
       .catch(() => caches.match(req, { ignoreSearch: true }).then((r) => r || caches.match('/index.html'))),
+  );
+});
+
+// A push carries no body: the PC sends nothing a push service could read.
+// It only ever means one thing.
+self.addEventListener('push', (ev) => {
+  ev.waitUntil(
+    self.registration.showNotification('Horadric', {
+      body: 'A session waits for you',
+      tag: 'horadric-wait',
+      renotify: true,
+      icon: '/icon.png',
+      badge: '/icon.png',
+    }),
+  );
+});
+
+self.addEventListener('notificationclick', (ev) => {
+  ev.notification.close();
+  ev.waitUntil(
+    self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then((list) => {
+      const mine = list.find((c) => new URL(c.url).origin === location.origin);
+      return mine ? mine.focus() : self.clients.openWindow('/');
+    }),
   );
 });

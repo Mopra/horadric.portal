@@ -30,3 +30,11 @@ test('ids and secrets are checked', () => {
   assert.ok(!R.isSecret('short'));
   assert.ok(R.isSecret('x'.repeat(43)));
 });
+
+test('pings are recognised, nothing else is', () => {
+  assert.ok(R.isPing(Buffer.from('{"ping":1}')));
+  assert.ok(!R.isPing(Buffer.from('{"ping":2}')));
+  assert.ok(!R.isPing(Buffer.from('{"open":1}')));
+  assert.ok(!R.isPing(Buffer.from('not json')));
+  assert.ok(!R.isPing(Buffer.from('x'.repeat(100))));
+});

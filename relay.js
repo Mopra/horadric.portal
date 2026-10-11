@@ -36,7 +36,18 @@ function nextChannel(last, taken) {
   }
 }
 
+// A liveness ping from either end, answered by the relay and never passed on.
+function isPing(data) {
+  if (!data || data.length > 64) return false;
+  try {
+    const m = JSON.parse(data.toString());
+    return !!m && m.ping === 1;
+  } catch {
+    return false;
+  }
+}
+
 const isId = (s) => typeof s === 'string' && /^[0-9a-f]{32}$/.test(s);
 const isSecret = (s) => typeof s === 'string' && s.length >= 16 && s.length <= 256;
 
-module.exports = { BROADCAST, MAX_FRAME, MAX_PHONES, pcId, frame, unframe, nextChannel, isId, isSecret };
+module.exports = { BROADCAST, MAX_FRAME, MAX_PHONES, pcId, frame, unframe, nextChannel, isPing, isId, isSecret };
