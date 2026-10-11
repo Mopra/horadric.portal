@@ -721,12 +721,74 @@ let zoom = Number(localStorage.getItem('horadric.textzoom')) || 0;
 // that right align a status line are drawn for the PC's width, and wrapped
 // they turn into rows of dashes, so they are cut to the phone's first.
 const RULE = /[─━═╌┄┈\-]{4,}/g;
-function fitLine(line, cols) {
-  if ([...line].length <= cols) return line;
-  if (/^[─━═╌┄┈\-\s]+$/.test(line)) return line.trim().slice(0, cols);
-  let out = line.replace(RULE, (run) => run.slice(0, 3));
-  if ([...out].length > cols) out = out.replace(/(\S) {3,}(?=\S)/g, '$1  ');
+const GAP = /(?<=\S) {3,}(?=\S)/g;
+
+// A line as cells, one per character, each with the index of its run in
+// the PC's styles (-1 for plain), so fitting a line keeps its colours.
+function cells(line, runs) {
+  const chars = [...line];
+  const style = new Array(chars.length).fill(-1);
+  let at = 0;
+  (runs || []).forEach((r, i) => {
+    for (let k = 0; k < r[0] && at < chars.length; k++) style[at++] = i;
+  });
+  return chars.map((c, i) => [c, style[i]]);
+}
+
+// Drops the characters of each match of `re` past its first `keep`.
+function squeeze(cs, re, keep) {
+  const text = cs.map((c) => c[0]).join('');
+  const at = [];
+  cs.forEach((c, i) => { for (let k = 0; k < c[0].length; k++) at.push(i); });
+  at.push(cs.length);
+  const drop = new Set();
+  for (const m of text.matchAll(re)) {
+    const from = at[m.index];
+    const to = at[m.index + m[0].length];
+    for (let i = from + keep; i < to; i++) drop.add(i);
+  }
+  return drop.size ? cs.filter((_, i) => !drop.has(i)) : cs;
+}
+
+function fitLine(cs, cols) {
+  if (cs.length <= cols) return cs;
+  if (/^[─━═╌┄┈\-\s]+$/.test(cs.map((c) => c[0]).join(''))) {
+    const first = cs.findIndex((c) => c[0] !== ' ');
+    return cs.slice(first).slice(0, cols);
+  }
+  let out = squeeze(cs, RULE, 3);
+  if (out.length > cols) out = squeeze(out, GAP, 2);
   return out;
+}
+
+const ESC = { '&': '&amp;', '<': '&lt;', '>': '&gt;' };
+const hex = (n) => '#' + n.toString(16).padStart(6, '0');
+
+// The CSS of a run from the PC: [count, fg, bg, flags], colours as
+// 0xRRGGBB or null for the terminal's own.
+function runCss(r) {
+  let css = '';
+  if (r[1] != null) css += `color:${hex(r[1])};`;
+  if (r[2] != null) css += `background:${hex(r[2])};`;
+  if (r[3] & 1) css += 'font-weight:bold;';
+  if (r[3] & 2) css += 'font-style:italic;';
+  const lines = [r[3] & 4 && 'underline', r[3] & 8 && 'line-through'].filter(Boolean);
+  if (lines.length) css += `text-decoration:${lines.join(' ')};`;
+  return css;
+}
+
+function lineHtml(cs, runs) {
+  let html = '';
+  let i = 0;
+  while (i < cs.length) {
+    const s = cs[i][1];
+    let text = '';
+    while (i < cs.length && cs[i][1] === s) text += cs[i++][0];
+    text = text.replace(/[&<>]/g, (c) => ESC[c]);
+    const css = s < 0 ? '' : runCss(runs[s]);
+    html += css ? `<span style="${css}">${text}</span>` : text;
+  }
+  return html;
 }
 
 // The width of one monospace cell at the screen's font size.
@@ -745,9 +807,15 @@ function renderScreen() {
   const size = Math.max(9, Math.min(22, 13 + zoom));
   pre.style.fontSize = size + 'px';
   const cols = Math.max(20, Math.floor((pre.clientWidth - 12) / cellWidth(pre)));
-  pre.textContent = sc
-    ? (sc.lines || []).map((l) => fitLine(l, cols)).join('\n')
-    : state.paused ? 'This session is paused.' : 'Waiting for the screen...';
+  if (sc) {
+    // A PC before colours sends no styles, and its lines draw plain.
+    const styles = sc.styles || [];
+    pre.innerHTML = (sc.lines || [])
+      .map((l, i) => lineHtml(fitLine(cells(l, styles[i]), cols), styles[i]))
+      .join('\n');
+  } else {
+    pre.textContent = state.paused ? 'This session is paused.' : 'Waiting for the screen...';
+  }
   $('resumebar').hidden = !state.paused;
   if (atBottom || !renderScreen.seen) wrap.scrollTop = wrap.scrollHeight;
   renderScreen.seen = true;
