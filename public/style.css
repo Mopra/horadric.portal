@@ -135,6 +135,18 @@ code { font-family: ui-monospace, "Cascadia Mono", Menlo, monospace; color: var(
 .sess.waiting .line { color: var(--waiting); }
 
 .foot { padding: 24px 12px calc(env(safe-area-inset-bottom) + 24px); text-align: center; }
+.paste { display: flex; gap: 8px; margin-top: 20px; }
+.paste input {
+  flex: 1;
+  min-width: 0;
+  padding: 10px 12px;
+  border-radius: 8px;
+  border: 1px solid var(--line);
+  background: var(--well);
+  color: inherit;
+  font-size: 16px;
+}
+.foot .link { display: block; margin: 0 auto 12px; }
 .link { background: none; border: 0; color: var(--legend); text-decoration: underline; font-size: 13px; }
 
 #session { display: flex; flex-direction: column; overflow: hidden; }

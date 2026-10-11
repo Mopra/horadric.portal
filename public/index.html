@@ -30,6 +30,12 @@
     <li>Scan the code it shows with this phone, or open the link it prints.</li>
     <li>Add this page to your home screen.</li>
   </ol>
+  <form id="pasteform" class="paste">
+    <input id="pastelink" type="url" placeholder="Or paste a pairing link" autocomplete="off" autocapitalize="off" spellcheck="false">
+    <button type="submit" class="pill">Pair</button>
+  </form>
+  <p id="pastehint" class="dim"></p>
+  <p class="dim">On an iPhone the home screen app does not share the browser's pairing. Pair in the browser, tap Copy pairing link there, and paste it here.</p>
   <p class="dim">The key stays in the link and on this phone. The relay passes encrypted frames and cannot read them.</p>
 </main>
 
@@ -40,6 +46,7 @@
   <footer class="foot">
     <button id="notify" class="pill" hidden>Notify me when a session waits</button>
     <p id="notifyhint" class="dim" hidden></p>
+    <button id="copylink" class="link">Copy pairing link</button>
     <button id="forget" class="link">Forget this PC</button>
   </footer>
 </main>

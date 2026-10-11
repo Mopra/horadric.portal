@@ -20,20 +20,32 @@ function savePcs(list) {
 }
 
 // A pairing link carries everything in its fragment, which no server ever
-// sees. Take it and wipe it from the address bar.
-function takeFragment() {
-  if (location.hash.length < 2) return;
-  const p = new URLSearchParams(location.hash.slice(1));
+// sees. Returns whether `fragment` held a pairing.
+function pairWith(fragment) {
+  const p = new URLSearchParams(fragment.replace(/^[^#]*#/, ''));
   const id = p.get('id');
   const k = p.get('k');
   const r = p.get('r');
-  if (id && k && r && /^[0-9a-f]{32}$/.test(id)) {
-    const pcs = loadPcs().filter((pc) => pc.id !== id);
-    pcs.push({ id, k, r: r.replace(/\/+$/, ''), n: p.get('n') || 'PC' });
-    savePcs(pcs);
-    localStorage.setItem('horadric.current', id);
-  }
+  if (!id || !k || !r || !/^[0-9a-f]{32}$/.test(id)) return false;
+  const pcs = loadPcs().filter((pc) => pc.id !== id);
+  pcs.push({ id, k, r: r.replace(/\/+$/, ''), n: p.get('n') || 'PC' });
+  savePcs(pcs);
+  localStorage.setItem('horadric.current', id);
+  return true;
+}
+
+// Take the link from the address bar, then wipe it from there.
+function takeFragment() {
+  if (location.hash.length < 2) return;
+  pairWith(location.hash);
   history.replaceState(null, '', location.pathname);
+}
+
+// The same link the PC prints, so it can be carried somewhere this
+// browser's storage does not reach.
+function linkFor(pc) {
+  const q = new URLSearchParams({ r: pc.r, id: pc.id, k: pc.k, n: pc.n });
+  return `${location.origin}/#${q}`;
 }
 
 // Encryption: AES-256-GCM, 12 byte nonce first.
@@ -585,6 +597,28 @@ $('forget').onclick = () => {
   const pcs = loadPcs().filter((p) => p.id !== state.pc.id);
   savePcs(pcs);
   choose(pcs[0] || null);
+};
+
+// On iOS a home screen app keeps storage of its own, and the camera opens
+// links only in the browser, so a pairing has to be carried over by hand.
+$('copylink').onclick = async () => {
+  if (!state.pc) return;
+  try {
+    await navigator.clipboard.writeText(linkFor(state.pc));
+    $('copylink').textContent = 'Copied. Paste it in the home screen app.';
+  } catch {
+    prompt('Copy this pairing link:', linkFor(state.pc));
+  }
+};
+$('pasteform').onsubmit = (ev) => {
+  ev.preventDefault();
+  if (!pairWith($('pastelink').value.trim())) {
+    $('pastehint').textContent = 'That is not a pairing link.';
+    return;
+  }
+  $('pastelink').value = '';
+  $('pastehint').textContent = '';
+  pairFromLink();
 };
 
 document.addEventListener('visibilitychange', () => {
