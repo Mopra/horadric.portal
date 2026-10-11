@@ -1,0 +1,14 @@
+{
+  "name": "Horadric",
+  "short_name": "Horadric",
+  "description": "Your coding agents, from anywhere.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#141518",
+  "theme_color": "#141518",
+  "icons": [
+    { "src": "/icon-256.png", "sizes": "256x256", "type": "image/png" },
+    { "src": "/icon.png", "sizes": "512x512", "type": "image/png", "purpose": "any" }
+  ]
+}

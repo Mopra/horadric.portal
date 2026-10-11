@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>Pair a phone: Horadric</title>
+<link rel="icon" href="/icon-256.png">
+<style>
+  body { margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center;
+    background: #141518; color: #e8e9ed; font: 15px/1.4 -apple-system, "Segoe UI", system-ui, sans-serif; }
+  main { text-align: center; padding: 24px; max-width: 420px; }
+  h1 { font-family: Georgia, serif; font-weight: normal; color: #d4b26a; margin: 0 0 6px; }
+  p { color: #8f939e; margin: 6px 0 18px; }
+  #qr { background: #fff; padding: 16px; border-radius: 12px; display: inline-block; line-height: 0; }
+  #qr svg { width: 280px; height: 280px; }
+  .warn { color: #ffb224; font-size: 13px; margin-top: 18px; }
+  .err { color: #ff5d66; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Town Portal</h1>
+  <p id="lead">Scan with your phone's camera to pair it with <b id="name">this PC</b>.</p>
+  <div id="qr"></div>
+  <p class="warn">Anyone with this code can control this PC. Run <code>horadric portal rekey</code> to unpair every phone.</p>
+</main>
+<script src="/qrcode.js"></script>
+<script>
+  // The pairing link is in the fragment, which never left this browser.
+  // The code is drawn here, so it does not leave it now either.
+  (function () {
+    var frag = location.hash.slice(1);
+    var p = new URLSearchParams(frag);
+    if (!p.get('id') || !p.get('k') || !p.get('r')) {
+      document.getElementById('lead').innerHTML = '<span class="err">No pairing link here. Run <code>horadric portal</code> on the PC.</span>';
+      document.getElementById('qr').hidden = true;
+      return;
+    }
+    document.getElementById('name').textContent = p.get('n') || 'this PC';
+    var link = location.origin + '/#' + frag;
+    var qr = qrcode(0, 'M');
+    qr.addData(link);
+    qr.make();
+    document.getElementById('qr').innerHTML = qr.createSvgTag({ cellSize: 6, margin: 0, scalable: true });
+  })();
+</script>
+</body>
+</html>

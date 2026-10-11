@@ -1,0 +1,22 @@
+[Unit]
+Description=Horadric Town Portal relay
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+User=horadric
+WorkingDirectory=/opt/horadric-portal
+# The docker bridge address: Traefik reaches it as host.docker.internal,
+# and it is not reachable from the internet.
+Environment=HOST=10.0.0.1
+Environment=PORT=43200
+ExecStart=/usr/bin/node server.js
+Restart=always
+RestartSec=2
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

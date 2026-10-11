@@ -1,0 +1,15 @@
+{
+  "name": "horadric-portal",
+  "version": "0.1.0",
+  "description": "The Town Portal relay and phone page for Horadric",
+  "license": "MIT",
+  "private": true,
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test test/*.test.js"
+  },
+  "dependencies": {
+    "ws": "^8.22.0"
+  }
+}

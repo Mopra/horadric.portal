@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#141518">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Horadric">
+<title>Horadric</title>
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="icon" href="/icon-256.png">
+<link rel="apple-touch-icon" href="/icon.png">
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header id="bar">
+  <button id="back" class="icon" hidden aria-label="Back">&#8249;</button>
+  <div id="title">Horadric</div>
+  <select id="pcs" hidden aria-label="Computer"></select>
+  <span id="status" class="status"><i class="lamp"></i><span>Starting</span></span>
+</header>
+
+<main id="unpaired" class="view" hidden>
+  <h1>Town Portal</h1>
+  <p>Reach the agents on your PC from here.</p>
+  <ol>
+    <li>On the PC, run <code>horadric portal</code>.</li>
+    <li>Scan the code it shows with this phone, or open the link it prints.</li>
+    <li>Add this page to your home screen.</li>
+  </ol>
+  <p class="dim">The key stays in the link and on this phone. The relay passes encrypted frames and cannot read them.</p>
+</main>
+
+<main id="list" class="view" hidden>
+  <div id="note" class="note" hidden></div>
+  <div id="groups"></div>
+  <div id="empty" class="dim center" hidden>No sessions on this PC.</div>
+  <footer class="foot">
+    <button id="forget" class="link">Forget this PC</button>
+  </footer>
+</main>
+
+<main id="session" class="view" hidden>
+  <div id="screenwrap"><pre id="screen"></pre></div>
+  <div id="keys">
+    <button data-k="&#13;">Enter</button>
+    <button data-k="&#27;">Esc</button>
+    <button data-k="&#27;[A">&#8593;</button>
+    <button data-k="&#27;[B">&#8595;</button>
+    <button data-k="&#9;">Tab</button>
+    <button data-k="&#27;[Z">&#8679;Tab</button>
+    <button data-k="&#3;">Ctrl+C</button>
+    <button data-k="1">1</button>
+    <button data-k="2">2</button>
+    <button data-k="3">3</button>
+    <button data-k="y">y</button>
+    <button data-k="n">n</button>
+    <button id="zoomout" class="zoom">A&#8722;</button>
+    <button id="zoomin" class="zoom">A+</button>
+  </div>
+  <form id="send">
+    <textarea id="text" rows="1" placeholder="Message" autocomplete="off" autocapitalize="sentences" enterkeyhint="send"></textarea>
+    <button type="submit">Send</button>
+  </form>
+</main>
+
+<script src="/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,32 @@
+# Routes https://portal.horadric.dev (page and WebSockets) to the Town
+# Portal relay on the host, which listens on the docker bridge, 10.0.0.1:43200.
+http:
+  routers:
+    horadric-portal-https:
+      entryPoints:
+        - https
+      rule: "Host(`portal.horadric.dev`)"
+      service: horadric-portal
+      tls:
+        certResolver: letsencrypt
+
+    horadric-portal-http-redirect:
+      entryPoints:
+        - http
+      rule: "Host(`portal.horadric.dev`)"
+      service: horadric-portal
+      middlewares:
+        - horadric-portal-https-redirect
+
+  middlewares:
+    horadric-portal-https-redirect:
+      redirectScheme:
+        scheme: https
+        permanent: true
+
+  services:
+    horadric-portal:
+      loadBalancer:
+        passHostHeader: true
+        servers:
+          - url: "http://host.docker.internal:43200"
