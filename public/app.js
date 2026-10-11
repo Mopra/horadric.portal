@@ -1,9 +1,12 @@
 // The Town Portal page: the phone's side of docs/PORTAL.md. It talks to
-// the PC through the relay, and everything it says is encrypted with the
-// pairing key, which lives only in this browser.
+// the PC through the relay, and everything it says is encrypted with this
+// phone's own key, which lives only on the PC and in this browser. A PC
+// on Horadric 0.21 shares one key with every phone instead.
 'use strict';
 
-const VERSION = 1;
+const VERSION = 2;
+// The PC versions this page speaks: 1 is Horadric 0.21.
+const SPEAKS = [1, 2];
 const $ = (id) => document.getElementById(id);
 
 // Pairing
@@ -20,15 +23,32 @@ function savePcs(list) {
 }
 
 // A pairing link carries everything in its fragment, which no server ever
-// sees. Returns whether `fragment` held a pairing.
+// sees. Returns whether `fragment` held a pairing. From Horadric 0.22 the
+// PC's link holds a one-time code (p, good until x) that the page trades
+// for a key of this phone's own (k); a link from 0.21 holds the PC's one
+// key as k.
 function pairWith(fragment) {
   const p = new URLSearchParams(fragment.replace(/^[^#]*#/, ''));
   const id = p.get('id');
   const k = p.get('k');
+  const pk = p.get('p');
   const r = p.get('r');
-  if (!id || !k || !r || !/^[0-9a-f]{32}$/.test(id)) return false;
+  if (!id || !(k || pk) || !r || !/^[0-9a-f]{32}$/.test(id)) return false;
+  const before = loadPcs().find((pc) => pc.id === id);
   const pcs = loadPcs().filter((pc) => pc.id !== id);
-  pcs.push({ id, k, r: r.replace(/\/+$/, ''), n: p.get('n') || 'PC' });
+  const pc = { id, r: r.replace(/\/+$/, ''), n: p.get('n') || 'PC' };
+  if (k) pc.k = k;
+  else {
+    pc.pk = pk;
+    pc.x = Number(p.get('x')) || 0;
+    // An old link opened again must not cost the key this phone has: it
+    // stays until the new code pays off, and is used if the code fails.
+    if (before && before.k) {
+      pc.k = before.k;
+      pc.phone = before.phone;
+    }
+  }
+  pcs.push(pc);
   savePcs(pcs);
   localStorage.setItem('horadric.current', id);
   return true;
@@ -41,11 +61,36 @@ function takeFragment() {
   history.replaceState(null, '', location.pathname);
 }
 
-// The same link the PC prints, so it can be carried somewhere this
-// browser's storage does not reach.
+// A link that carries this pairing somewhere this browser's storage does
+// not reach: this phone's key once it has one, else the code not yet used.
 function linkFor(pc) {
-  const q = new URLSearchParams({ r: pc.r, id: pc.id, k: pc.k, n: pc.n });
-  return `${location.origin}/#${q}`;
+  const q = pc.k ? { r: pc.r, id: pc.id, k: pc.k, n: pc.n } : { r: pc.r, id: pc.id, p: pc.pk, x: pc.x, n: pc.n };
+  return `${location.origin}/#${new URLSearchParams(q)}`;
+}
+
+function savePc(pc) {
+  savePcs(loadPcs().map((p) => (p.id === pc.id ? pc : p)));
+}
+
+// What the PC lists this phone as, in `horadric portal phones`.
+function deviceName() {
+  const ua = navigator.userAgent;
+  const device =
+    [
+      [/iPhone/, 'iPhone'],
+      [/iPad/, 'iPad'],
+      [/Android/, 'Android'],
+      [/Mac OS X/, 'Mac'],
+      [/Windows/, 'Windows'],
+    ].find(([re]) => re.test(ua))?.[1] || 'Phone';
+  const browser =
+    [
+      [/EdgA?\//, 'Edge'],
+      [/Firefox|FxiOS/, 'Firefox'],
+      [/CriOS|Chrome/, 'Chrome'],
+      [/Safari/, 'Safari'],
+    ].find(([re]) => re.test(ua))?.[1] || '';
+  return browser ? `${device}, ${browser}` : device;
 }
 
 // Encryption: AES-256-GCM, 12 byte nonce first.
@@ -84,6 +129,10 @@ const state = {
   sessions: [],
   projects: [],
   vapid: null,
+  s: null, // this connection's id from the PC's hello, sent back on every message
+  n: 0, // the count on the last message sent
+  answered: null, // the timer that gives up on a PC that never answers hello
+  warning: null, // a note that stays: another phone took this phone's pairing code
   starting: null, // { project, at }
   paused: false, // the watched session answered watch with paused
   heard: 0, // when the relay last said anything, ms
@@ -118,8 +167,9 @@ async function connect() {
   const pc = state.pc;
   if (!pc) return;
   setLink('connecting');
+  state.s = null;
   try {
-    state.key = await importKey(pc.k);
+    state.key = await importKey(pc.pk || pc.k);
   } catch {
     $('note').hidden = false;
     $('note').textContent = 'This pairing link is broken. Pair again with horadric portal.';
@@ -144,8 +194,8 @@ async function connect() {
       if (msg.pong) return;
       if (msg.relay === 'online') {
         setLink('online');
-        send({ t: 'hello', v: VERSION });
-        if (state.watching) send({ t: 'watch', id: state.watching });
+        if (state.pc.pk) pairNow();
+        else greet();
       } else if (msg.relay === 'offline') {
         setLink('pcoff');
       }
@@ -189,21 +239,95 @@ function wake() {
   else ws.send('{"ping":1}');
 }
 
+// After hello every message carries the connection's s and a count, so
+// the relay cannot play an old one back to the PC.
 async function send(obj) {
   const ws = state.ws;
   if (!ws || ws.readyState !== 1 || !state.key) return false;
+  if (state.s && obj.t !== 'hello' && obj.t !== 'pair') obj = { ...obj, s: state.s, n: ++state.n };
   ws.send(await seal(state.key, obj));
   return true;
 }
 
+function greet() {
+  state.s = null;
+  send({ t: 'hello', v: VERSION });
+  clearTimeout(state.answered);
+  state.answered = setTimeout(
+    () => say('The PC does not answer this phone. It may have forgotten it: run horadric portal on the PC and pair again.'),
+    10000,
+  );
+}
+
+// Trades the one-time code for a key of this phone's own.
+function pairNow() {
+  if (state.pc.x && Date.now() / 1000 > state.pc.x) {
+    codeFailed('This pairing code ran out. Run horadric portal on the PC for a new one.');
+    return;
+  }
+  send({ t: 'pair', v: VERSION, name: deviceName() });
+}
+
+// The code was used or ran out: forget it, and go on with the key this
+// phone had before, if any.
+function codeFailed(text, used) {
+  const pc = state.pc;
+  if (used) state.warning = text;
+  delete pc.pk;
+  delete pc.x;
+  savePc(pc);
+  if (pc.k) connect();
+  else if (!used) say(text);
+  renderNote();
+}
+
+async function paired(msg) {
+  const pc = state.pc;
+  try {
+    state.key = await importKey(msg.key);
+  } catch {
+    return;
+  }
+  pc.k = msg.key;
+  pc.phone = msg.phone;
+  delete pc.pk;
+  delete pc.x;
+  savePc(pc);
+  greet();
+}
+
+// The PC forgot this phone, so its key is no good any more.
+function unpaired() {
+  const pc = state.pc;
+  delete pc.k;
+  savePc(pc);
+  if (state.ws) {
+    state.ws.onclose = null;
+    state.ws.close();
+    state.ws = null;
+  }
+  setLink('offline');
+  say(`${pc.n} forgot this phone. To use it again, run horadric portal on the PC and pair again.`);
+}
+
 function onMessage(msg) {
   switch (msg.t) {
+    case 'paired':
+      paired(msg);
+      break;
+    case 'unpaired':
+      unpaired();
+      break;
     case 'hello':
-      state.tooOld = msg.v !== VERSION;
+      clearTimeout(state.answered);
+      state.s = typeof msg.s === 'string' ? msg.s : null;
+      state.n = 0;
+      if (state.watching) send({ t: 'watch', id: state.watching });
+      state.tooOld = !SPEAKS.includes(msg.v);
       state.pcName = msg.pc || state.pc.n;
       if (msg.pc && msg.pc !== state.pc.n) {
         state.pc.n = msg.pc;
-        savePcs(loadPcs().map((p) => (p.id === state.pc.id ? state.pc : p)));
+        savePc(state.pc);
         renderPcs();
       }
       state.vapid = typeof msg.vapid === 'string' ? msg.vapid : null;
@@ -240,6 +364,10 @@ function onMessage(msg) {
       }
       break;
     case 'error':
+      if (msg.code === 'used' || msg.code === 'expired') {
+        codeFailed(msg.text, msg.code === 'used');
+        break;
+      }
       if (state.watching && /paused/i.test(msg.text || '')) {
         state.paused = true;
         renderScreen();
@@ -263,7 +391,8 @@ const phaseOf = (s) => (PHASES.includes(s.phase) ? s.phase : 'idle');
 function renderNote() {
   const note = $('note');
   let text = '';
-  if (state.tooOld) text = 'This PC runs a Horadric this page does not speak. Update Horadric on the PC.';
+  if (state.warning) text = state.warning;
+  else if (state.tooOld) text = 'This PC runs a Horadric this page does not speak. Update Horadric on the PC.';
   else if (state.link === 'pcoff') text = `${state.pc ? state.pc.n : 'The PC'} is not connected. Is Horadric running, with horadric portal on?`;
   else if (state.link === 'offline') text = 'Cannot reach the relay. Retrying.';
   note.hidden = !text;
@@ -665,6 +794,7 @@ function choose(pc) {
   state.sessions = [];
   state.projects = [];
   state.vapid = null;
+  state.warning = null;
   state.starting = null;
   state.watching = null;
   state.tooOld = false;
