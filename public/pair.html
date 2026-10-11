@@ -23,7 +23,7 @@
   <h1>Town Portal</h1>
   <p id="lead">Scan with your phone's camera to pair it with <b id="name">this PC</b>.</p>
   <div id="qr"></div>
-  <p class="warn">Anyone with this code can control this PC. Run <code>horadric portal rekey</code> to unpair every phone.</p>
+  <p class="warn" id="warn">This code works once, for <b id="left">5 minutes</b>. <code>horadric portal phones</code> on the PC shows every paired phone.</p>
 </main>
 <script src="/qrcode.js"></script>
 <script>
@@ -32,7 +32,7 @@
   (function () {
     var frag = location.hash.slice(1);
     var p = new URLSearchParams(frag);
-    if (!p.get('id') || !p.get('k') || !p.get('r')) {
+    if (!p.get('id') || !(p.get('p') || p.get('k')) || !p.get('r')) {
       document.getElementById('lead').innerHTML = '<span class="err">No pairing link here. Run <code>horadric portal</code> on the PC.</span>';
       document.getElementById('qr').hidden = true;
       return;
@@ -43,6 +43,26 @@
     qr.addData(link);
     qr.make();
     document.getElementById('qr').innerHTML = qr.createSvgTag({ cellSize: 6, margin: 0, scalable: true });
+    // A one-time code runs out: say how long it has, then hide it. A link
+    // from Horadric 0.21 (k=) has no end, and says what it always said.
+    var until = Number(p.get('x'));
+    if (!p.get('p')) {
+      document.getElementById('warn').textContent =
+        'Anyone with this code can control this PC. Update Horadric on the PC for codes that work once.';
+      return;
+    }
+    if (!until) return;
+    function tick() {
+      var s = Math.round(until - Date.now() / 1000);
+      if (s <= 0) {
+        document.getElementById('qr').hidden = true;
+        document.getElementById('warn').textContent = 'This code ran out. Run horadric portal on the PC for a new one.';
+        return;
+      }
+      document.getElementById('left').textContent = Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0');
+      setTimeout(tick, 1000);
+    }
+    tick();
   })();
 </script>
 </body>
