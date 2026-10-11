@@ -15,6 +15,14 @@
   #qr { background: #f4f1ea; padding: 18px; border-radius: 24px; display: inline-block; line-height: 0;
     box-shadow: 0 0 0 1px rgba(212, 178, 106, 0.35), 0 18px 60px -12px rgba(212, 178, 106, 0.28); }
   #qr svg { width: 288px; height: 288px; display: block; }
+  #copy { display: flex; align-items: center; gap: 8px; width: 324px; box-sizing: border-box; margin: 14px auto 0;
+    padding: 8px 8px 8px 12px; border-radius: 10px; background: #1d1f24; border: 1px solid #2a2c32; cursor: pointer; }
+  #copy[hidden] { display: none; }
+  #copy:hover { border-color: rgba(212, 178, 106, 0.5); }
+  #link { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: left;
+    font: 12px/1.4 ui-monospace, Consolas, monospace; color: #8f939e; user-select: all; }
+  #copy button { flex: none; font: inherit; font-size: 13px; color: #141518; background: #d4b26a; border: 0;
+    border-radius: 6px; padding: 4px 10px; cursor: pointer; }
   #bar { width: 324px; height: 3px; margin: 18px auto 0; border-radius: 2px; background: #2a2c32; overflow: hidden; }
   #fill { height: 100%; background: #d4b26a; transition: width 1s linear; }
   .warn { color: #ffb224; font-size: 13px; margin-top: 18px; }
@@ -26,6 +34,7 @@
   <h1>Town Portal</h1>
   <p id="lead">Scan with your phone's camera to pair it with <b id="name">this PC</b>.</p>
   <div id="qr"></div>
+  <div id="copy" hidden title="Copy the pairing link"><span id="link"></span><button type="button">Copy</button></div>
   <div id="bar" hidden><div id="fill"></div></div>
   <p class="warn" id="warn">This code works once, for <b id="left">5 minutes</b>. <code>horadric portal phones</code> on the PC shows every paired phone.</p>
 </main>
@@ -44,6 +53,19 @@
     document.getElementById('name').textContent = p.get('n') || 'this PC';
     var link = location.origin + '/#' + frag;
     document.getElementById('qr').innerHTML = draw(link);
+    // For a phone that cannot scan, or pairing this browser itself: the
+    // same link, to paste.
+    var copy = document.getElementById('copy'), button = copy.querySelector('button');
+    document.getElementById('link').textContent = link;
+    copy.hidden = false;
+    copy.onclick = function () {
+      navigator.clipboard.writeText(link).then(function () {
+        button.textContent = 'Copied';
+        setTimeout(function () { button.textContent = 'Copy'; }, 1500);
+      }, function () {
+        getSelection().selectAllChildren(document.getElementById('link'));
+      });
+    };
     // A one-time code runs out: say how long it has, then hide it. A link
     // from Horadric 0.21 (k=) has no end, and says what it always said.
     var until = Number(p.get('x'));
@@ -61,6 +83,7 @@
       fill.style.width = Math.max(0, s / span * 100) + '%';
       if (s <= 0) {
         document.getElementById('qr').hidden = true;
+        copy.hidden = true;
         bar.hidden = true;
         document.getElementById('warn').textContent = 'This code ran out. Run horadric portal on the PC for a new one.';
         return;
