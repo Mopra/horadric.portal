@@ -12,8 +12,11 @@
   main { text-align: center; padding: 24px; max-width: 420px; }
   h1 { font-family: Georgia, serif; font-weight: normal; color: #d4b26a; margin: 0 0 6px; }
   p { color: #8f939e; margin: 6px 0 18px; }
-  #qr { background: #fff; padding: 16px; border-radius: 12px; display: inline-block; line-height: 0; }
-  #qr svg { width: 280px; height: 280px; }
+  #qr { background: #f4f1ea; padding: 18px; border-radius: 24px; display: inline-block; line-height: 0;
+    box-shadow: 0 0 0 1px rgba(212, 178, 106, 0.35), 0 18px 60px -12px rgba(212, 178, 106, 0.28); }
+  #qr svg { width: 288px; height: 288px; display: block; }
+  #bar { width: 324px; height: 3px; margin: 18px auto 0; border-radius: 2px; background: #2a2c32; overflow: hidden; }
+  #fill { height: 100%; background: #d4b26a; transition: width 1s linear; }
   .warn { color: #ffb224; font-size: 13px; margin-top: 18px; }
   .err { color: #ff5d66; }
 </style>
@@ -23,6 +26,7 @@
   <h1>Town Portal</h1>
   <p id="lead">Scan with your phone's camera to pair it with <b id="name">this PC</b>.</p>
   <div id="qr"></div>
+  <div id="bar" hidden><div id="fill"></div></div>
   <p class="warn" id="warn">This code works once, for <b id="left">5 minutes</b>. <code>horadric portal phones</code> on the PC shows every paired phone.</p>
 </main>
 <script src="/qrcode.js"></script>
@@ -39,10 +43,7 @@
     }
     document.getElementById('name').textContent = p.get('n') || 'this PC';
     var link = location.origin + '/#' + frag;
-    var qr = qrcode(0, 'M');
-    qr.addData(link);
-    qr.make();
-    document.getElementById('qr').innerHTML = qr.createSvgTag({ cellSize: 6, margin: 0, scalable: true });
+    document.getElementById('qr').innerHTML = draw(link);
     // A one-time code runs out: say how long it has, then hide it. A link
     // from Horadric 0.21 (k=) has no end, and says what it always said.
     var until = Number(p.get('x'));
@@ -52,10 +53,15 @@
       return;
     }
     if (!until) return;
+    var bar = document.getElementById('bar'), fill = document.getElementById('fill');
+    var span = Math.max(1, until - Date.now() / 1000);
+    bar.hidden = false;
     function tick() {
       var s = Math.round(until - Date.now() / 1000);
+      fill.style.width = Math.max(0, s / span * 100) + '%';
       if (s <= 0) {
         document.getElementById('qr').hidden = true;
+        bar.hidden = true;
         document.getElementById('warn').textContent = 'This code ran out. Run horadric portal on the PC for a new one.';
         return;
       }
@@ -64,6 +70,36 @@
     }
     tick();
   })();
+
+  // Round dots, round eyes and the cube in the middle. Level Q error
+  // correction lets the cube hide the middle of the code and still scan,
+  // with fewer, larger dots than level H.
+  function draw(text) {
+    var qr = qrcode(0, 'Q');
+    qr.addData(text);
+    qr.make();
+    var n = qr.getModuleCount(), ink = '#141518';
+    var logo = Math.round(n * 0.22) | 1, lo = (n - logo) / 2, hi = lo + logo;
+    function eye(r, c) { return (r < 7 || r >= n - 7) && (c < 7 || c >= n - 7) && !(r >= n - 7 && c >= n - 7); }
+    function hidden(r, c) { return r >= lo - 0.5 && r < hi + 0.5 && c >= lo - 0.5 && c < hi + 0.5; }
+    var dots = '';
+    for (var r = 0; r < n; r++) {
+      for (var c = 0; c < n; c++) {
+        if (qr.isDark(r, c) && !eye(r, c) && !hidden(r, c)) {
+          dots += 'M' + (c + 0.5) + ' ' + (r + 0.05) + 'a.45 .45 0 1 1 0 .9a.45 .45 0 1 1 0-.9z';
+        }
+      }
+    }
+    var eyes = '';
+    [[0, 0], [0, n - 7], [n - 7, 0]].forEach(function (o) {
+      var y = o[0], x = o[1];
+      eyes += '<rect x="' + (x + 0.5) + '" y="' + (y + 0.5) + '" width="6" height="6" rx="2" fill="none" stroke="' + ink + '"/>' +
+        '<rect x="' + (x + 2) + '" y="' + (y + 2) + '" width="3" height="3" rx="1" fill="' + ink + '"/>';
+    });
+    return '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ' + n + ' ' + n + '" role="img" aria-label="Pairing code">' +
+      '<path d="' + dots + '" fill="' + ink + '"/>' + eyes +
+      '<image href="/icon-256.png" x="' + lo + '" y="' + lo + '" width="' + logo + '" height="' + logo + '"/></svg>';
+  }
 </script>
 </body>
 </html>
