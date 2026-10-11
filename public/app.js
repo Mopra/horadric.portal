@@ -597,11 +597,15 @@ window.addEventListener('resize', () => state.watching && renderScreen());
 
 // Start
 
-takeFragment();
-{
+// A pairing link opened on a page that is already up only changes the
+// fragment, so take it then too.
+function pairFromLink() {
+  takeFragment();
   const pcs = loadPcs();
   const current = localStorage.getItem('horadric.current');
   choose(pcs.find((p) => p.id === current) || pcs[0] || null);
 }
+window.addEventListener('hashchange', pairFromLink);
+pairFromLink();
 
 if ('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js').catch(() => {});
