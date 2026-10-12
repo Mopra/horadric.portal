@@ -425,6 +425,7 @@ function renderKeys(s) {
 }
 
 function renderTitle() {
+  renderDots();
   if (state.watching) {
     const s = state.sessions.find((x) => x.id === state.watching);
     renderKeys(s);
@@ -968,6 +969,55 @@ $('latest').onclick = () => {
 
 // Navigation
 
+// The sessions of the project the open one belongs to, in the list's order.
+function siblings() {
+  const g = grouped().find((x) => x.list.some((s) => s.id === state.watching));
+  return g ? g.list : [];
+}
+
+// One dot per session of the project, the open one lit. Shown only when
+// there is somebody to swipe to.
+function renderDots() {
+  const list = state.watching ? siblings() : [];
+  const box = $('dots');
+  box.hidden = list.length < 2;
+  box.replaceChildren(...list.map((s) => el('i', s.id === state.watching ? 'on' : '')));
+}
+
+// The screen slides in from the side the swipe came from.
+function swipeIn(way) {
+  const box = $('screenbox');
+  box.classList.remove('swipe-next', 'swipe-prev');
+  if (still.matches) return;
+  void box.offsetWidth;
+  box.classList.add(way === 'next' ? 'swipe-next' : 'swipe-prev');
+}
+
+// A horizontal swipe on the screen goes to the next or previous session of
+// the project. Two fingers are the pinch's, and a mostly vertical move is
+// scrolling.
+const swipe = { x: 0, y: 0, live: false };
+$('screenwrap').addEventListener('touchstart', (ev) => {
+  swipe.live = ev.touches.length === 1;
+  if (swipe.live) [swipe.x, swipe.y] = [ev.touches[0].clientX, ev.touches[0].clientY];
+}, { passive: true });
+$('screenwrap').addEventListener('touchmove', (ev) => {
+  if (ev.touches.length > 1) swipe.live = false;
+}, { passive: true });
+$('screenwrap').addEventListener('touchend', (ev) => {
+  if (!swipe.live || ev.changedTouches.length !== 1) return;
+  swipe.live = false;
+  const dx = ev.changedTouches[0].clientX - swipe.x;
+  const dy = ev.changedTouches[0].clientY - swipe.y;
+  if (Math.abs(dx) < 70 || Math.abs(dx) < 2 * Math.abs(dy)) return;
+  // Selecting text is not a swipe.
+  if (String(getSelection()).length) return;
+  const list = siblings();
+  const at = list.findIndex((s) => s.id === state.watching);
+  const to = list[at + (dx < 0 ? 1 : -1)];
+  if (to) watch(to.id, dx < 0 ? 'next' : 'prev');
+});
+
 // How deep a view sits, so going deeper slides in from the right and back
 // slides the other way.
 const DEPTH = { unpaired: 0, list: 0, projects: 1, session: 1 };
@@ -1011,7 +1061,7 @@ function settle() {
   }
 }
 
-function watch(id) {
+function watch(id, way) {
   const again = state.watching === id;
   // A session started from the projects view takes that view's place in
   // history, so back goes to the session list.
@@ -1024,6 +1074,7 @@ function watch(id) {
   renderTitle();
   renderScreen();
   send({ t: 'watch', id });
+  if (way) swipeIn(way);
   // One history entry for the session view, whichever session it shows.
   if (swap) history.replaceState({ session: id }, '');
   else if (!again) history.pushState({ session: id }, '');

@@ -352,6 +352,13 @@ code { font-family: ui-monospace, "Cascadia Mono", Menlo, monospace; color: var(
 @keyframes out-fwd { to { transform: translateX(-30%); opacity: 0.4; } }
 @keyframes out-back { to { transform: translateX(100%); } }
 #bar { position: relative; z-index: 3; }
+#dots { display: flex; justify-content: center; gap: 6px; padding: 5px 0 3px; }
+#dots i { width: 6px; height: 6px; border-radius: 50%; background: var(--legend); opacity: 0.5; }
+#dots i.on { background: var(--text, #e6e6e6); opacity: 1; }
+#screenbox.swipe-next { animation: swipe-next 0.2s ease-out; }
+#screenbox.swipe-prev { animation: swipe-prev 0.2s ease-out; }
+@keyframes swipe-next { from { transform: translateX(40%); opacity: 0.3; } }
+@keyframes swipe-prev { from { transform: translateX(-40%); opacity: 0.3; } }
 html { overflow: hidden; }
 .skeleton .sess { cursor: default; }
 .bone {
@@ -366,6 +373,6 @@ html { overflow: hidden; }
 .skeleton .sess:nth-of-type(3) .bone.name { width: 40%; }
 @keyframes shimmer { to { background-position: -200% 0; } }
 @media (prefers-reduced-motion: reduce) {
-  .view.entering, .view.leaving { animation: none; }
+  .view.entering, .view.leaving, #screenbox { animation: none; }
   .bone { animation: none; }
 }
