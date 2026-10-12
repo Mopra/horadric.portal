@@ -469,6 +469,36 @@ html { overflow: hidden; }
 .cbtns .link { margin-left: auto; }
 .csent { color: var(--done); font-size: 14px; }
 
+/* Quests: each project's log, Warriv's line, adding a quest */
+.log .warriv { margin: -2px 0 8px 4px; font-size: 12px; color: var(--dim); }
+.log .warriv.drives { color: var(--gold); }
+.quest { align-items: flex-start; padding: 10px 12px; }
+.quest .lamp { margin-top: 5px; }
+.quest .name { white-space: normal; font-weight: 500; }
+.quest .notes { margin-top: 6px; font-size: 13px; color: var(--dim); white-space: pre-wrap; overflow-wrap: anywhere; }
+.quest.blocked, .quest.tangled { border-color: rgba(255, 93, 102, 0.45); }
+.quest.blocked .line, .quest.tangled .line { color: var(--error); }
+.quest.review .line { color: var(--done); }
+.quest.working .line { color: var(--working); }
+.quest .resume { align-self: center; }
+.lamp.review { background: var(--done); }
+.lamp.blocked { background: var(--error); }
+.addquest { margin: 0 0 8px; }
+.addquest input { flex-basis: 100%; }
+.addquest textarea {
+  flex-basis: 100%;
+  min-width: 0;
+  padding: 10px 12px;
+  border-radius: 8px;
+  border: 1px solid var(--line);
+  background: var(--well);
+  color: inherit;
+  font: 16px/1.3 -apple-system, "Segoe UI", sans-serif;
+  resize: vertical;
+}
+#qhint { flex-basis: 100%; margin: 0; font-size: 13px; }
+#qhint.bad { color: var(--error); }
+
 /* 0.24: what a session changed */
 #changes { flex: none; background: var(--plate); border-bottom: 1px solid #000; }
 #changesum {
