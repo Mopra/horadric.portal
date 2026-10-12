@@ -713,7 +713,13 @@ async function resendPush() {
   } catch {}
 }
 
+// The screen's text size is kept as an offset from the base size, so a
+// size saved before pinching (whole steps from the A buttons) still reads.
+const BASE_TEXT = 13;
+const MIN_TEXT = 8;
+const MAX_TEXT = 28;
 let zoom = Number(localStorage.getItem('horadric.textzoom')) || 0;
+const textSize = () => Math.max(MIN_TEXT, Math.min(MAX_TEXT, BASE_TEXT + zoom));
 
 // A PC terminal is 150 columns or more and a phone fits about 45 readable
 // ones. Shrinking the PC's width to the phone made text too small to read,
@@ -804,8 +810,7 @@ function renderScreen() {
   const pre = $('screen');
   const wrap = $('screenwrap');
   const atBottom = wrap.scrollHeight - wrap.scrollTop - wrap.clientHeight < 40;
-  const size = Math.max(9, Math.min(22, 13 + zoom));
-  pre.style.fontSize = size + 'px';
+  pre.style.fontSize = textSize() + 'px';
   const cols = Math.max(20, Math.floor((pre.clientWidth - 12) / cellWidth(pre)));
   if (sc) {
     // A PC before colours sends no styles, and its lines draw plain.
@@ -892,16 +897,75 @@ $('keys').addEventListener('click', (ev) => {
   typeInto(b.dataset.k);
 });
 
-$('zoomin').onclick = () => {
-  zoom += 1;
-  localStorage.setItem('horadric.textzoom', zoom);
+// Pinching the screen sizes its text. The text rewraps at every size, so
+// the anchor is how far down the content the fingers' midpoint sits, which
+// rewrapping keeps roughly where it was.
+const pinch = { from: 0, size: 0, at: 0, y: 0, frame: 0 };
+
+function fingers(ev) {
+  const [a, b] = ev.touches;
+  return { gap: Math.hypot(a.clientX - b.clientX, a.clientY - b.clientY), y: (a.clientY + b.clientY) / 2 };
+}
+
+function zoomTo(size, y) {
+  const wrap = $('screenwrap');
+  const top = y - wrap.getBoundingClientRect().top;
+  const at = (wrap.scrollTop + top) / (wrap.scrollHeight || 1);
+  zoom = Math.max(MIN_TEXT, Math.min(MAX_TEXT, size)) - BASE_TEXT;
   renderScreen();
-};
-$('zoomout').onclick = () => {
-  zoom -= 1;
+  wrap.scrollTop = at * wrap.scrollHeight - top;
+}
+
+// Settles on a half pixel, so the size kept is one the page draws again.
+function saveZoom(size, y) {
+  cancelAnimationFrame(pinch.frame);
+  pinch.frame = 0;
+  zoomTo(Math.round(size * 2) / 2, y);
   localStorage.setItem('horadric.textzoom', zoom);
-  renderScreen();
-};
+}
+
+const screenwrap = $('screenwrap');
+screenwrap.addEventListener('touchstart', (ev) => {
+  if (ev.touches.length !== 2) return;
+  const f = fingers(ev);
+  pinch.from = f.gap || 1;
+  pinch.size = textSize();
+  pinch.at = pinch.size;
+  pinch.y = f.y;
+}, { passive: true });
+screenwrap.addEventListener('touchmove', (ev) => {
+  if (ev.touches.length !== 2 || !pinch.from) return;
+  ev.preventDefault();
+  const f = fingers(ev);
+  pinch.at = pinch.size * (f.gap / pinch.from);
+  pinch.y = f.y;
+  // Rewrapping the whole screen costs a layout, so once a frame at most.
+  pinch.frame ||= requestAnimationFrame(() => {
+    pinch.frame = 0;
+    zoomTo(pinch.at, pinch.y);
+  });
+}, { passive: false });
+screenwrap.addEventListener('touchend', (ev) => {
+  if (ev.touches.length >= 2 || !pinch.from) return;
+  pinch.from = 0;
+  saveZoom(pinch.at, pinch.y);
+});
+screenwrap.addEventListener('touchcancel', () => {
+  if (!pinch.from) return;
+  pinch.from = 0;
+  saveZoom(pinch.at, pinch.y);
+});
+// Safari's own pinch gesture would scale the whole page instead.
+document.addEventListener('gesturestart', (ev) => ev.preventDefault());
+// A trackpad pinch on a computer arrives as a wheel with Ctrl held.
+screenwrap.addEventListener('wheel', (ev) => {
+  if (!ev.ctrlKey) return;
+  ev.preventDefault();
+  const size = textSize() * Math.exp(-ev.deltaY / 100);
+  zoomTo(size, ev.clientY);
+  clearTimeout(pinch.idle);
+  pinch.idle = setTimeout(() => saveZoom(size, ev.clientY), 300);
+}, { passive: false });
 
 $('send').addEventListener('submit', (ev) => {
   ev.preventDefault();
