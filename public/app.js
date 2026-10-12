@@ -141,8 +141,12 @@ const state = {
   backoff: 1000,
   timer: null,
   tooOld: false,
-  view: 'list', // unpaired | list | projects | session
+  view: 'list', // unpaired | list | projects | quests | session
   folders: null, // the PC's folders answer, null until it comes
+  quests: null, // the PC's quests answer, null until it comes
+  adding: null, // the project whose add-a-quest form is open
+  open: new Set(), // the quests whose notes show, by project and title
+  added: null, // { project, at } while an added quest is on its way
   listed: false, // a sessions answer came from this PC, so the list is real
 };
 
@@ -155,6 +159,7 @@ function setLink(link) {
   label.textContent = words[link];
   renderNote();
   renderList();
+  if (state.view === 'quests') renderQuests();
 }
 
 // Connection
@@ -338,6 +343,19 @@ function onMessage(msg) {
       renderPush();
       resendPush();
       if (state.view === 'projects') askFolders();
+      if (state.view === 'quests') askQuests();
+      break;
+    case 'quests':
+      state.quests = Array.isArray(msg.list) ? msg.list : [];
+      renderQuests();
+      break;
+    case 'quest_added':
+      // The text stays in the form until the PC has it, so an error
+      // costs nothing typed.
+      if (addForm.el) addForm.el.reset();
+      state.added = null;
+      state.adding = null;
+      renderQuests();
       break;
     case 'projects':
       state.projects = Array.isArray(msg.list) ? msg.list : [];
@@ -357,6 +375,7 @@ function onMessage(msg) {
       state.listed = true;
       state.sessions = Array.isArray(msg.list) ? msg.list : [];
       renderList();
+      if (state.view === 'quests') renderQuests();
       renderTitle();
       break;
     case 'screen':
@@ -380,6 +399,10 @@ function onMessage(msg) {
         state.starting = null;
         renderList();
         renderFolders();
+      }
+      if (state.added) {
+        state.added = null;
+        renderQuests();
       }
       say(msg.text || 'The PC reported an error.');
       break;
@@ -408,6 +431,8 @@ function renderTitle() {
     $('title').textContent = s ? s.name : 'Session';
   } else if (state.view === 'projects') {
     $('title').textContent = 'Open project';
+  } else if (state.view === 'quests') {
+    $('title').textContent = 'Quests';
   } else {
     $('title').textContent = state.pc ? state.pc.n : 'Horadric';
   }
@@ -543,7 +568,7 @@ function renderList() {
 
 // A note on whichever view is up, so an error is seen where it happened.
 function say(text) {
-  const note = state.view === 'projects' ? $('pnote') : $('note');
+  const note = { projects: $('pnote'), quests: $('qnote') }[state.view] || $('note');
   note.hidden = false;
   note.textContent = text;
 }
@@ -659,6 +684,170 @@ function renderFolders() {
   }
   if (!out.length) out.push(el('div', 'dim center', q ? 'No project matches.' : 'The PC knows no project folders yet.'));
   $('folders').replaceChildren(...out);
+}
+
+// Quests: each project's quest log and what Warriv does there. The phone
+// reads them and adds to them; it does not drive anything yet.
+
+function askQuests() {
+  const at = Date.now();
+  askQuests.at = at;
+  send({ t: 'quests' });
+  setTimeout(() => {
+    if (askQuests.at !== at || state.quests || state.view !== 'quests') return;
+    say('The PC did not send its quests. Quests on the phone need Horadric 0.24 or later on the PC.');
+  }, 8000);
+}
+
+function openQuests() {
+  $('qnote').hidden = true;
+  show('quests');
+  history.pushState({ quests: true }, '');
+  renderTitle();
+  renderQuests();
+  askQuests();
+}
+
+// What a quest's state reads as, and its lamp.
+const QUEST = {
+  open: ['Ready', ''],
+  after: ['After', 'idle'],
+  tangled: ['Tangled', 'blocked'],
+  working: ['Working', 'working'],
+  review: ['For review', 'review'],
+  blocked: ['Blocked', 'blocked'],
+};
+
+// What the head of a project's log says about Warriv and the mode.
+function warrivWords(log) {
+  const w = log.warriv || {};
+  const who = w.drives ? 'Warriv drives' : w.on ? 'Warriv is on' : '';
+  const mode = { review: 'Review', warriv: 'Warriv reviews', auto: 'Auto' }[log.mode] || '';
+  return [who, w.line, !w.drives && mode].filter(Boolean).join(' · ');
+}
+
+function renderQuests() {
+  if (!state.quests) {
+    const wait = el('div', 'dim center', state.link === 'online' ? 'Asking the PC for its quests...' : 'Waiting for the PC...');
+    $('logs').replaceChildren(wait);
+    return;
+  }
+  const out = [];
+  for (const log of state.quests) {
+    if (!log || !log.project) continue;
+    const quests = Array.isArray(log.quests) ? log.quests : [];
+    const sec = el('section', 'group log');
+    const head = el('div', 'ghead');
+    head.append(el('h2', null, log.name || baseName(log.project)));
+    const plus = el('button', 'plus', '+');
+    plus.setAttribute('aria-label', `New quest in ${log.name}`);
+    plus.disabled = state.link !== 'online';
+    plus.onclick = () => {
+      state.adding = state.adding === log.project ? null : log.project;
+      renderQuests();
+      if (state.adding) $('qtitle').focus();
+    };
+    head.append(plus);
+    sec.append(head);
+    const words = warrivWords(log);
+    if (words) sec.append(el('div', 'warriv' + (log.warriv && log.warriv.drives ? ' drives' : ''), words));
+    if (state.adding === log.project) sec.append(addForm(log));
+    for (const q of quests) sec.append(questRow(log, q));
+    const done = Number(log.done) || 0;
+    if (!quests.length) sec.append(el('div', 'dim none', done ? `All ${done} done` : 'No quests'));
+    else if (done) sec.append(el('div', 'dim none', `${done} done`));
+    out.push(sec);
+  }
+  if (!out.length) out.push(el('div', 'dim center', 'No projects on the PC.'));
+  $('logs').replaceChildren(...out);
+}
+
+function questRow(log, q) {
+  const [word, lamp] = QUEST[q.state] || [q.state || '', ''];
+  const id = log.project + '\n' + q.title;
+  const notes = Array.isArray(q.notes) ? q.notes : [];
+  const row = el('div', 'sess quest ' + (q.state || ''));
+  row.setAttribute('role', 'button');
+  row.tabIndex = 0;
+  const what = el('div', 'what');
+  // The PC's why for a quest that waits on another says "after" already.
+  const why = String(q.why || '');
+  const line = !why ? word : q.state === 'after' ? why[0].toUpperCase() + why.slice(1) : `${word}: ${why}`;
+  what.append(el('div', 'name', q.title), el('div', 'line', line));
+  if (state.open.has(id)) what.append(el('div', 'notes' + (notes.length ? '' : ' dim'), notes.length ? notes.join('\n') : 'No notes'));
+  row.append(el('i', 'lamp ' + lamp), what);
+  // The session on it, which the phone can open like any other.
+  const holder = q.session && state.sessions.find((s) => s.id === q.session);
+  if (holder) {
+    const go = el('button', 'resume', 'Open');
+    go.setAttribute('aria-label', `Open ${holder.name}`);
+    go.onclick = (ev) => {
+      ev.stopPropagation();
+      watch(holder.id);
+    };
+    row.append(go);
+  }
+  row.onclick = () => {
+    if (!state.open.delete(id)) state.open.add(id);
+    renderQuests();
+  };
+  return row;
+}
+
+// The form a project's + opens. It is made once and moved, so what is
+// typed survives the re-renders an update from the PC causes.
+function addForm(log) {
+  const f = (addForm.el ||= makeAddForm());
+  f.dataset.project = log.project;
+  const sending = !!state.added;
+  const b = f.querySelector('button');
+  b.disabled = sending || state.link !== 'online';
+  b.textContent = sending ? 'Adding...' : 'Add quest';
+  return f;
+}
+
+function makeAddForm() {
+  const f = el('form', 'create addquest');
+  const title = el('input');
+  title.id = 'qtitle';
+  title.placeholder = 'Quest';
+  title.maxLength = 200;
+  title.autocomplete = 'off';
+  title.setAttribute('enterkeyhint', 'next');
+  const notes = el('textarea');
+  notes.id = 'qnotes';
+  notes.placeholder = 'Notes for the agent (optional)';
+  notes.rows = 3;
+  const add = el('button', 'pill', 'Add quest');
+  add.type = 'submit';
+  const hint = el('p', 'dim');
+  hint.id = 'qhint';
+  f.append(title, notes, add, hint);
+  title.addEventListener('input', () => (hint.textContent = ''));
+  f.onsubmit = (ev) => {
+    ev.preventDefault();
+    const t = title.value.trim().replace(/\s+/g, ' ');
+    if (!t) {
+      hint.className = 'dim bad';
+      hint.textContent = 'Say what the quest is.';
+      return;
+    }
+    if (state.added || state.link !== 'online') return;
+    const project = f.dataset.project;
+    const at = Date.now();
+    state.added = { project, at };
+    send({ t: 'quest_add', project, title: t, notes: notes.value });
+    haptic('send');
+    hint.textContent = '';
+    renderQuests();
+    setTimeout(() => {
+      if (!state.added || state.added.at !== at) return;
+      state.added = null;
+      renderQuests();
+      say('The PC did not add the quest. Adding quests needs Horadric 0.24 or later on the PC.');
+    }, 10000);
+  };
+  return f;
 }
 
 function resume(id) {
@@ -858,7 +1047,7 @@ function renderScreen() {
 
 // How deep a view sits, so going deeper slides in from the right and back
 // slides the other way.
-const DEPTH = { unpaired: 0, list: 0, projects: 1, session: 1 };
+const DEPTH = { unpaired: 0, list: 0, projects: 1, quests: 1, session: 1 };
 const still = matchMedia('(prefers-reduced-motion: reduce)');
 
 function show(view) {
@@ -867,8 +1056,8 @@ function show(view) {
   const leaving = from !== view && !$(from).hidden ? $(from) : null;
   // Measured while it still shows, since hidden it has no size.
   const where = leaving && leaving.getBoundingClientRect();
-  for (const v of ['unpaired', 'list', 'projects', 'session']) $(v).hidden = v !== view;
-  $('back').hidden = view !== 'session' && view !== 'projects';
+  for (const v of ['unpaired', 'list', 'projects', 'quests', 'session']) $(v).hidden = v !== view;
+  $('back').hidden = DEPTH[view] === 0;
   if (leaving) slide(leaving, where, $(view), DEPTH[view] < DEPTH[from] ? 'back' : 'fwd');
 }
 
@@ -903,7 +1092,7 @@ function watch(id) {
   const again = state.watching === id;
   // A session started from the projects view takes that view's place in
   // history, so back goes to the session list.
-  const swap = (state.watching && !again) || state.view === 'projects';
+  const swap = (state.watching && !again) || state.view === 'projects' || state.view === 'quests';
   state.watching = id;
   state.screen = null;
   state.paused = false;
@@ -937,6 +1126,9 @@ function choose(pc) {
   state.watching = null;
   state.tooOld = false;
   state.folders = null;
+  state.quests = null;
+  state.adding = null;
+  state.added = null;
   state.listed = false;
   if (pc) localStorage.setItem('horadric.current', pc.id);
   renderPcs();
@@ -1072,13 +1264,14 @@ $('text').addEventListener('input', () => {
 $('back').onclick = () => history.back();
 window.addEventListener('popstate', () => {
   if (state.watching) return unwatch();
-  if (state.view === 'projects') {
+  if (state.view === 'projects' || state.view === 'quests') {
     show('list');
     renderTitle();
   }
 });
 
 $('openproject').onclick = openProjects;
+$('openquests').onclick = openQuests;
 $('search').addEventListener('input', renderFolders);
 $('newproject').onclick = () => {
   $('create').hidden = !$('create').hidden;

@@ -1,7 +1,7 @@
 // A stand-in for Horadric's PC side, to try the relay and the page without
 // a PC: node test/fakepc.js [relay ws url]. It prints a pairing link,
-// answers hello, lists sessions, projects and folders, starts and makes
-// projects, and echoes what the phone types into
+// answers hello, lists sessions, projects, folders and quest logs, starts
+// and makes projects, adds quests, and echoes what the phone types into
 // the watched session's screen.
 'use strict';
 const crypto = require('crypto');
@@ -96,6 +96,28 @@ for (const s of sessions) {
 }
 const watching = new Map();
 
+// Quest logs, as 0.24's quests answer has them, and the phones that asked.
+const logs = [
+  {
+    project: projects[0].path,
+    name: projects[0].name,
+    mode: 'warriv',
+    warriv: { on: true, drives: true, line: 'reads Build the inbox' },
+    done: 14,
+    quests: [
+      { title: 'Build the inbox', state: 'working', session: 's2', why: '', notes: ['See PLAN.md, item 2.', 'Cards on top of the list.'] },
+      { title: 'Pushes that say what waits', state: 'after', session: null, why: 'after Build the inbox', notes: ['After: Build the inbox'] },
+      { title: 'Pick a colour for the badge', state: 'blocked', session: 's3', why: 'which gold, the tile\'s or the title\'s?', notes: [] },
+      { title: 'Swipe between sessions', state: 'review', session: null, why: '', notes: [] },
+      { title: 'A quest with a long title that has to wrap over more than one line on a phone', state: 'open', session: null, why: '', notes: [] },
+    ],
+  },
+  { project: projects[1].path, name: projects[1].name, mode: 'manual', warriv: { on: false, drives: false, line: '' }, done: 3, quests: [] },
+  { project: projects[2].path, name: projects[2].name, mode: 'manual', warriv: { on: false, drives: false, line: '' }, done: 0, quests: [] },
+];
+const questsTo = new Set();
+const questsMessage = () => ({ t: 'quests', list: logs });
+
 let ws;
 function start() {
   ws = new WebSocket(`${relay}/pc?secret=${encodeURIComponent(secret)}`);
@@ -106,7 +128,10 @@ function start() {
       heard = Date.now();
       if (m.pong) return;
       console.log('relay:', m);
-      if (m.close) watching.delete(m.close);
+      if (m.close) {
+        watching.delete(m.close);
+        questsTo.delete(m.close);
+      }
       return;
     }
     const f = R.unframe(data);
@@ -151,6 +176,18 @@ function start() {
         broadcast({ t: 'sessions', list: sessions });
         for (const [ch, sid] of watching) if (sid === s.id) sendScreen(ch, sid);
       }, 1000);
+    } else if (msg.t === 'quests') {
+      questsTo.add(f.ch);
+      reply(questsMessage());
+    } else if (msg.t === 'quest_add') {
+      const log = logs.find((l) => l.project === msg.project);
+      const title = String(msg.title || '').trim().replace(/\s+/g, ' ');
+      if (!log) return reply({ t: 'error', text: `${msg.project} is not one of the PC's projects.` });
+      if (!title) return reply({ t: 'error', text: 'Say what the quest is.' });
+      const notes = String(msg.notes || '').split('\n').map((l) => l.trim()).filter(Boolean);
+      log.quests.push({ title, state: 'open', session: null, why: '', notes });
+      reply({ t: 'quest_added', project: log.project, title });
+      for (const ch of questsTo) ws.send(R.frame(ch, seal(questsMessage())));
     } else if (msg.t === 'push') {
       subs.set(msg.sub.endpoint, msg.sub);
       console.log('push subscription', msg.sub.endpoint.slice(0, 60));
