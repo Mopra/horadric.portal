@@ -428,6 +428,13 @@ code { font-family: ui-monospace, "Cascadia Mono", Menlo, monospace; color: var(
 @keyframes out-fwd { to { transform: translateX(-30%); opacity: 0.4; } }
 @keyframes out-back { to { transform: translateX(100%); } }
 #bar { position: relative; z-index: 3; }
+#dots { display: flex; justify-content: center; gap: 6px; padding: 5px 0 3px; }
+#dots i { width: 6px; height: 6px; border-radius: 50%; background: var(--legend); opacity: 0.5; }
+#dots i.on { background: var(--text, #e6e6e6); opacity: 1; }
+#screenbox.swipe-next { animation: swipe-next 0.2s ease-out; }
+#screenbox.swipe-prev { animation: swipe-prev 0.2s ease-out; }
+@keyframes swipe-next { from { transform: translateX(40%); opacity: 0.3; } }
+@keyframes swipe-prev { from { transform: translateX(-40%); opacity: 0.3; } }
 html { overflow: hidden; }
 .skeleton .sess { cursor: default; }
 .bone {
@@ -442,9 +449,25 @@ html { overflow: hidden; }
 .skeleton .sess:nth-of-type(3) .bone.name { width: 40%; }
 @keyframes shimmer { to { background-position: -200% 0; } }
 @media (prefers-reduced-motion: reduce) {
-  .view.entering, .view.leaving { animation: none; }
+  .view.entering, .view.leaving, #screenbox { animation: none; }
   .bone { animation: none; }
 }
+
+#inbox { margin-bottom: 8px; }
+.card {
+  padding: 12px;
+  margin-bottom: 8px;
+  border-radius: 10px;
+  border: 1px solid rgba(255, 178, 36, 0.55);
+  background: linear-gradient(#202227, #1a1b1f);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.08), 0 0 12px rgba(255, 178, 36, 0.18);
+}
+.ctop { display: flex; justify-content: space-between; gap: 8px; font-size: 12px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--waiting); }
+.cage { color: var(--dim); }
+.cwhat { margin: 6px 0 10px; font-size: 15px; word-break: break-word; display: -webkit-box; -webkit-line-clamp: 4; -webkit-box-orient: vertical; overflow: hidden; }
+.cbtns { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.cbtns .link { margin-left: auto; }
+.csent { color: var(--done); font-size: 14px; }
 
 /* Quests: each project's log, Warriv's line, adding a quest */
 .log .warriv { margin: -2px 0 8px 4px; font-size: 12px; color: var(--dim); }
