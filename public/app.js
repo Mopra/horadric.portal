@@ -54,10 +54,14 @@ function pairWith(fragment) {
   return true;
 }
 
-// Take the link from the address bar, then wipe it from there.
+// Take the link from the address bar, then wipe it from there. A
+// notification's link, #s=<session>&pc=<pc>, is kept in `state.open` for
+// the page to show that session.
 function takeFragment() {
   if (location.hash.length < 2) return;
-  pairWith(location.hash);
+  const p = new URLSearchParams(location.hash.slice(1));
+  if (p.get('s')) state.open = { id: p.get('s'), pc: p.get('pc') || '' };
+  else pairWith(location.hash);
   history.replaceState(null, '', location.pathname);
 }
 
@@ -122,6 +126,7 @@ async function open(key, buf) {
 
 const state = {
   pc: null,
+  open: null, // the session a notification asked to show, {id, pc}
   key: null,
   ws: null,
   link: 'connecting', // connecting | offline (relay down) | pcoff | online
@@ -377,6 +382,7 @@ function onMessage(msg) {
       renderList();
       if (state.view === 'quests') renderQuests();
       renderTitle();
+      renderBadge();
       break;
     case 'screen':
       if (msg.id === state.watching) {
@@ -385,7 +391,11 @@ function onMessage(msg) {
         renderScreen();
       }
       break;
+    case 'attached':
+      attached(msg);
+      break;
     case 'error':
+      if (state.attaching) attachDone();
       if (msg.code === 'used' || msg.code === 'expired') {
         codeFailed(msg.text, msg.code === 'used');
         break;
@@ -425,9 +435,22 @@ function renderNote() {
   note.textContent = text;
 }
 
+// Esc, Ctrl+C, arrows and Tab always fit. y, n and the digits answer a
+// prompt, so they show only while the session waits, and the digits only as
+// many as its `ask` has options (1 to 3 when an older PC sends no `ask`).
+function renderKeys(s) {
+  const waiting = !!s && phaseOf(s) === 'waiting';
+  const options = s && s.ask && Array.isArray(s.ask.options) ? s.ask.options.length : 3;
+  for (const b of $('keys').querySelectorAll('[data-answer]')) {
+    const k = b.dataset.k;
+    b.hidden = !waiting || (/^[0-9]$/.test(k) && Number(k) > options);
+  }
+}
+
 function renderTitle() {
   if (state.watching) {
     const s = state.sessions.find((x) => x.id === state.watching);
+    renderKeys(s);
     $('title').textContent = s ? s.name : 'Session';
   } else if (state.view === 'projects') {
     $('title').textContent = 'Open project';
@@ -436,6 +459,14 @@ function renderTitle() {
   } else {
     $('title').textContent = state.pc ? state.pc.n : 'Horadric';
   }
+}
+
+// The app icon's count of sessions waiting, as the pushes set it while the
+// page is shut. Where the browser has no badge, nothing.
+function renderBadge() {
+  if (!navigator.setAppBadge) return;
+  const n = state.sessions.filter((s) => s.phase === 'waiting').length;
+  (n ? navigator.setAppBadge(n) : navigator.clearAppBadge()).catch(() => {});
 }
 
 function renderPcs() {
@@ -1022,26 +1053,107 @@ function cellWidth(pre) {
   return ctx.measureText('M'.repeat(20)).width / 20 || 8;
 }
 
+// How far from the bottom still counts as following the output.
+const NEAR = 40;
+const atBottom = (wrap) => wrap.scrollHeight - wrap.scrollTop - wrap.clientHeight < NEAR;
+
+// How many lines fell off the top between two frames. Once the PC's 500
+// lines of scrollback are full, new output pushes old lines out, and
+// matching the new first lines against the old ones finds by how many,
+// so the rest keep their nodes instead of every line being redrawn.
+function dropped(old, lines) {
+  if (!old.length || !lines.length || old[0] === lines[0]) return 0;
+  const run = Math.min(8, lines.length);
+  for (let k = 1; k < old.length; k++) {
+    let m = 0;
+    while (m < run && k + m < old.length && old[k + m] === lines[m]) m++;
+    if (m === run || (m > 0 && k + m === old.length)) return k;
+  }
+  return 0;
+}
+
+// The screen is one div per line, and a frame changes only the lines
+// whose HTML differs, so a selection and the scroll position survive the
+// four updates a second. The HTML of each shown line is kept here.
+let shown = [];
+
 function renderScreen() {
   const sc = state.screen;
   const pre = $('screen');
   const wrap = $('screenwrap');
-  const atBottom = wrap.scrollHeight - wrap.scrollTop - wrap.clientHeight < 40;
+  const follow = atBottom(wrap) || !renderScreen.seen;
   pre.style.fontSize = textSize() + 'px';
+  // Whole pixel lines, since the browser rounds scrollTop and keeping the
+  // view still adds up line heights a frame at a time.
+  pre.style.lineHeight = Math.round(textSize() * 1.3) + 'px';
   const cols = Math.max(20, Math.floor((pre.clientWidth - 12) / cellWidth(pre)));
   if (sc) {
     // A PC before colours sends no styles, and its lines draw plain.
     const styles = sc.styles || [];
-    pre.innerHTML = (sc.lines || [])
-      .map((l, i) => lineHtml(fitLine(cells(l, styles[i]), cols), styles[i]))
-      .join('\n');
+    const html = (sc.lines || []).map((l, i) => lineHtml(fitLine(cells(l, styles[i]), cols), styles[i]));
+    if (!shown.length) pre.textContent = '';
+    // Where the reader is looking, to put it back after the change.
+    const anchor = follow ? null : firstVisible(pre, wrap);
+    const offset = anchor ? anchor.getBoundingClientRect().top : 0;
+    let lost = 0;
+    const k = dropped(shown, html);
+    for (let i = 0; i < k; i++) {
+      lost += pre.firstChild.offsetHeight;
+      pre.firstChild.remove();
+    }
+    shown = shown.slice(k);
+    const rows = pre.children;
+    html.forEach((h, i) => {
+      if (i < shown.length) {
+        if (shown[i] !== h) rows[i].innerHTML = h;
+      } else {
+        const div = document.createElement('div');
+        div.innerHTML = h;
+        pre.appendChild(div);
+      }
+    });
+    while (rows.length > html.length) pre.lastChild.remove();
+    shown = html;
+    // Measured to the subpixel, since rounded offsets drift a pixel a frame.
+    if (anchor && anchor.isConnected) wrap.scrollTop += anchor.getBoundingClientRect().top - offset;
+    else if (!follow) wrap.scrollTop -= lost;
   } else {
+    shown = [];
     pre.textContent = state.paused ? 'This session is paused.' : 'Waiting for the screen...';
   }
   $('resumebar').hidden = !state.paused;
-  if (atBottom || !renderScreen.seen) wrap.scrollTop = wrap.scrollHeight;
+  if (follow) wrap.scrollTop = wrap.scrollHeight;
   renderScreen.seen = true;
+  renderLatest();
 }
+
+// The first line at least partly in view, found by halving since a long
+// session has hundreds.
+function firstVisible(pre, wrap) {
+  const rows = pre.children;
+  const top = wrap.scrollTop;
+  let lo = 0;
+  let hi = rows.length - 1;
+  if (hi < 0) return null;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    const r = rows[mid];
+    if (r.offsetTop + r.offsetHeight <= top) lo = mid + 1;
+    else hi = mid;
+  }
+  return rows[lo];
+}
+
+function renderLatest() {
+  $('latest').hidden = !state.screen || atBottom($('screenwrap'));
+}
+
+$('screenwrap').addEventListener('scroll', renderLatest, { passive: true });
+$('latest').onclick = () => {
+  const wrap = $('screenwrap');
+  wrap.scrollTop = wrap.scrollHeight;
+  renderLatest();
+};
 
 // Navigation
 
@@ -1261,6 +1373,103 @@ $('text').addEventListener('input', () => {
   t.style.height = t.scrollHeight + 'px';
 });
 
+// Photos. The frame is 1 MB and base64 adds a third, so the page shrinks
+// the picture until it is well under that before sending it.
+
+const PHOTO_BYTES = 700 * 1024;
+
+async function bitmapOf(file) {
+  try {
+    return await createImageBitmap(file, { imageOrientation: 'from-image' });
+  } catch {
+    const url = URL.createObjectURL(file);
+    try {
+      const img = new Image();
+      img.src = url;
+      await img.decode();
+      return img;
+    } finally {
+      URL.revokeObjectURL(url);
+    }
+  }
+}
+
+// A JPEG under PHOTO_BYTES: the long side at most 2048 pixels, smaller
+// and rougher until it fits.
+async function shrink(file) {
+  const img = await bitmapOf(file);
+  const w0 = img.width, h0 = img.height;
+  let side = Math.min(2048, Math.max(w0, h0));
+  let quality = 0.85;
+  for (;;) {
+    const scale = side / Math.max(w0, h0);
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.max(1, Math.round(w0 * scale));
+    canvas.height = Math.max(1, Math.round(h0 * scale));
+    canvas.getContext('2d').drawImage(img, 0, 0, canvas.width, canvas.height);
+    const blob = await new Promise((done) => canvas.toBlob(done, 'image/jpeg', quality));
+    if (blob && (blob.size <= PHOTO_BYTES || side <= 320)) return blob;
+    if (quality > 0.6) quality -= 0.15;
+    else side = Math.round(side * 0.75);
+  }
+}
+
+function toB64url(blob) {
+  return new Promise((done, fail) => {
+    const r = new FileReader();
+    r.onload = () => done(r.result.slice(r.result.indexOf(',') + 1).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, ''));
+    r.onerror = () => fail(r.error);
+    r.readAsDataURL(blob);
+  });
+}
+
+function attachDone() {
+  clearTimeout(state.attaching && state.attaching.timer);
+  state.attaching = null;
+  $('attach').classList.remove('busy');
+  $('attach').disabled = false;
+}
+
+async function attachPhoto(file) {
+  const id = state.watching;
+  if (!id || state.attaching) return;
+  state.attaching = { id };
+  $('attach').classList.add('busy');
+  $('attach').disabled = true;
+  try {
+    const blob = await shrink(file);
+    const name = (file.name || 'photo').replace(/\.[^.]*$/, '') + '.jpg';
+    if (!(await send({ t: 'attach', id, name, data: await toB64url(blob) }))) throw new Error('offline');
+    // A PC before the attach message never answers.
+    state.attaching.timer = setTimeout(() => {
+      attachDone();
+      say('The PC did not take the photo. It may need a newer Horadric.');
+    }, 30000);
+  } catch {
+    attachDone();
+    say('Could not send that photo.');
+  }
+}
+
+// The PC saved it: its path goes into the message, for the agent to read.
+function attached(msg) {
+  if (!state.attaching || msg.id !== state.attaching.id) return;
+  attachDone();
+  if (typeof msg.path !== 'string' || msg.id !== state.watching) return;
+  const t = $('text');
+  const sep = t.value && !/\s$/.test(t.value) ? ' ' : '';
+  t.value += sep + msg.path + ' ';
+  t.dispatchEvent(new Event('input'));
+  t.focus();
+}
+
+$('attach').onclick = () => $('photo').click();
+$('photo').addEventListener('change', () => {
+  const file = $('photo').files[0];
+  $('photo').value = '';
+  if (file) attachPhoto(file);
+});
+
 $('back').onclick = () => history.back();
 window.addEventListener('popstate', () => {
   if (state.watching) return unwatch();
@@ -1344,11 +1553,34 @@ window.addEventListener('resize', () => state.watching && renderScreen());
 // fragment, so take it then too.
 function pairFromLink() {
   takeFragment();
+  // A notification's link on a page already up keeps its connection.
+  if (state.open && state.pc) return openFromPush();
   const pcs = loadPcs();
   const current = localStorage.getItem('horadric.current');
   choose(pcs.find((p) => p.id === current) || pcs[0] || null);
+  openFromPush();
+}
+
+// Shows the session a notification was about, on its PC when this phone
+// knows that PC. The watch goes out once connected, as after any hello.
+function openFromPush() {
+  const open = state.open;
+  state.open = null;
+  if (!open) return;
+  const pc = open.pc && loadPcs().find((p) => p.id === open.pc);
+  if (pc && (!state.pc || state.pc.id !== pc.id)) choose(pc);
+  if (state.pc) watch(open.id);
 }
 window.addEventListener('hashchange', pairFromLink);
 pairFromLink();
 
-if ('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js').catch(() => {});
+if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.register('/sw.js').catch(() => {});
+  // A notification clicked while the page is open.
+  navigator.serviceWorker.addEventListener('message', (ev) => {
+    const d = ev.data || {};
+    if (d.t !== 'open' || typeof d.id !== 'string') return;
+    state.open = { id: d.id, pc: typeof d.pc === 'string' ? d.pc : '' };
+    openFromPush();
+  });
+}
