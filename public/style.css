@@ -212,7 +212,20 @@ code { font-family: ui-monospace, "Cascadia Mono", Menlo, monospace; color: var(
   font: 16px/1.3 -apple-system, "Segoe UI", sans-serif;
   box-shadow: inset 0 2px 4px #000;
 }
-#send button {
+#send .clip {
+  padding: 0 10px;
+  border-radius: 10px;
+  border: 1px solid #000;
+  background: linear-gradient(#2a2c32, #202227);
+  color: var(--text);
+  font-weight: normal;
+  display: flex;
+  align-items: center;
+}
+#send .clip.busy { color: var(--gold); animation: pulse 1s ease-in-out infinite alternate; }
+@keyframes pulse { to { opacity: 0.4; } }
+@media (prefers-reduced-motion: reduce) { #send .clip.busy { animation: none; } }
+#send button:not(.clip) {
   padding: 0 16px;
   border-radius: 10px;
   border: 1px solid #000;

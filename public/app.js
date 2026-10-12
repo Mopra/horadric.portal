@@ -363,7 +363,11 @@ function onMessage(msg) {
         renderScreen();
       }
       break;
+    case 'attached':
+      attached(msg);
+      break;
     case 'error':
+      if (state.attaching) attachDone();
       if (msg.code === 'used' || msg.code === 'expired') {
         codeFailed(msg.text, msg.code === 'used');
         break;
@@ -924,6 +928,103 @@ $('text').addEventListener('input', () => {
   const t = $('text');
   t.style.height = '';
   t.style.height = t.scrollHeight + 'px';
+});
+
+// Photos. The frame is 1 MB and base64 adds a third, so the page shrinks
+// the picture until it is well under that before sending it.
+
+const PHOTO_BYTES = 700 * 1024;
+
+async function bitmapOf(file) {
+  try {
+    return await createImageBitmap(file, { imageOrientation: 'from-image' });
+  } catch {
+    const url = URL.createObjectURL(file);
+    try {
+      const img = new Image();
+      img.src = url;
+      await img.decode();
+      return img;
+    } finally {
+      URL.revokeObjectURL(url);
+    }
+  }
+}
+
+// A JPEG under PHOTO_BYTES: the long side at most 2048 pixels, smaller
+// and rougher until it fits.
+async function shrink(file) {
+  const img = await bitmapOf(file);
+  const w0 = img.width, h0 = img.height;
+  let side = Math.min(2048, Math.max(w0, h0));
+  let quality = 0.85;
+  for (;;) {
+    const scale = side / Math.max(w0, h0);
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.max(1, Math.round(w0 * scale));
+    canvas.height = Math.max(1, Math.round(h0 * scale));
+    canvas.getContext('2d').drawImage(img, 0, 0, canvas.width, canvas.height);
+    const blob = await new Promise((done) => canvas.toBlob(done, 'image/jpeg', quality));
+    if (blob && (blob.size <= PHOTO_BYTES || side <= 320)) return blob;
+    if (quality > 0.6) quality -= 0.15;
+    else side = Math.round(side * 0.75);
+  }
+}
+
+function toB64url(blob) {
+  return new Promise((done, fail) => {
+    const r = new FileReader();
+    r.onload = () => done(r.result.slice(r.result.indexOf(',') + 1).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, ''));
+    r.onerror = () => fail(r.error);
+    r.readAsDataURL(blob);
+  });
+}
+
+function attachDone() {
+  clearTimeout(state.attaching && state.attaching.timer);
+  state.attaching = null;
+  $('attach').classList.remove('busy');
+  $('attach').disabled = false;
+}
+
+async function attachPhoto(file) {
+  const id = state.watching;
+  if (!id || state.attaching) return;
+  state.attaching = { id };
+  $('attach').classList.add('busy');
+  $('attach').disabled = true;
+  try {
+    const blob = await shrink(file);
+    const name = (file.name || 'photo').replace(/\.[^.]*$/, '') + '.jpg';
+    if (!(await send({ t: 'attach', id, name, data: await toB64url(blob) }))) throw new Error('offline');
+    // A PC before the attach message never answers.
+    state.attaching.timer = setTimeout(() => {
+      attachDone();
+      say('The PC did not take the photo. It may need a newer Horadric.');
+    }, 30000);
+  } catch {
+    attachDone();
+    say('Could not send that photo.');
+  }
+}
+
+// The PC saved it: its path goes into the message, for the agent to read.
+function attached(msg) {
+  if (!state.attaching || msg.id !== state.attaching.id) return;
+  attachDone();
+  if (typeof msg.path !== 'string' || msg.id !== state.watching) return;
+  const t = $('text');
+  const sep = t.value && !/\s$/.test(t.value) ? ' ' : '';
+  t.value += sep + msg.path + ' ';
+  t.dispatchEvent(new Event('input'));
+  t.focus();
+}
+
+$('attach').onclick = () => $('photo').click();
+$('photo').addEventListener('change', () => {
+  const file = $('photo').files[0];
+  $('photo').value = '';
+  if (file) attachPhoto(file);
 });
 
 $('back').onclick = () => history.back();
