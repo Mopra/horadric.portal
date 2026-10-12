@@ -144,6 +144,7 @@ const state = {
   view: 'list', // unpaired | list | projects | session
   folders: null, // the PC's folders answer, null until it comes
   listed: false, // a sessions answer came from this PC, so the list is real
+  sent: new Map(), // session id -> { label, since }: an inbox answer sent, until the phase moves
 };
 
 function setLink(link) {
@@ -356,6 +357,7 @@ function onMessage(msg) {
     case 'sessions':
       state.listed = true;
       state.sessions = Array.isArray(msg.list) ? msg.list : [];
+      pruneSent();
       renderList();
       renderTitle();
       break;
@@ -406,14 +408,30 @@ function renderNote() {
   note.textContent = text;
 }
 
+// Sessions waiting on the human, longest wait first, and the count in the
+// tab title and the page's title bar.
+const waitingList = () =>
+  state.sessions
+    .filter((s) => phaseOf(s) === 'waiting' && !s.paused)
+    .sort((a, b) => (askSince(a) || Infinity) - (askSince(b) || Infinity));
+
+// `since` as seconds or milliseconds since the epoch, whichever the PC sent.
+function askSince(s) {
+  const t = Number(s.ask && s.ask.since);
+  if (!t) return 0;
+  return t < 1e12 ? t * 1000 : t;
+}
+
 function renderTitle() {
+  const n = waitingList().length;
+  document.title = n ? `(${n}) Horadric` : 'Horadric';
   if (state.watching) {
     const s = state.sessions.find((x) => x.id === state.watching);
     $('title').textContent = s ? s.name : 'Session';
   } else if (state.view === 'projects') {
     $('title').textContent = 'Open project';
   } else {
-    $('title').textContent = state.pc ? state.pc.n : 'Horadric';
+    $('title').textContent = (state.pc ? state.pc.n : 'Horadric') + (n ? ` (${n} waiting)` : '');
   }
 }
 
@@ -492,7 +510,73 @@ function skeleton() {
   return out;
 }
 
+// "5s", "3m", "2h": how long a card has waited.
+function ago(since) {
+  const sec = Math.max(0, Math.floor((Date.now() - since) / 1000));
+  if (sec < 60) return sec + 's';
+  if (sec < 3600) return Math.floor(sec / 60) + 'm';
+  return Math.floor(sec / 3600) + 'h';
+}
+
+// An answer is "Sent" until the session leaves that wait: its phase moves, or
+// a new ask replaces the one answered.
+function pruneSent() {
+  for (const [id, sent] of state.sent) {
+    const s = state.sessions.find((x) => x.id === id);
+    if (!s || phaseOf(s) !== 'waiting' || askSince(s) !== sent.since) state.sent.delete(id);
+  }
+}
+
+function answer(s, opt) {
+  haptic('answer');
+  state.sent.set(s.id, { label: opt.label, since: askSince(s) });
+  send({ t: 'input', id: s.id, data: opt.keys });
+  renderInbox();
+}
+
+function card(s) {
+  const ask = s.ask && typeof s.ask === 'object' ? s.ask : null;
+  const c = el('article', 'card');
+  const top = el('div', 'ctop');
+  top.append(el('span', 'cproj', s.project ? baseName(s.project) : s.name || s.id));
+  const since = askSince(s);
+  if (since) top.append(el('span', 'cage', ago(since)));
+  c.append(top);
+  const what = ask ? [ask.tool, ask.detail].filter(Boolean).join(': ') : '';
+  c.append(el('div', 'cwhat', what || s.line || 'Waiting for you'));
+  const row = el('div', 'cbtns');
+  const sent = state.sent.get(s.id);
+  const options = ask && Array.isArray(ask.options) ? ask.options.filter((o) => o && o.label && typeof o.keys === 'string') : [];
+  if (sent) {
+    row.append(el('span', 'csent', `Sent: ${sent.label}`));
+  } else {
+    for (const o of options) {
+      const b = el('button', 'pill', o.label);
+      b.onclick = () => answer(s, o);
+      row.append(b);
+    }
+  }
+  const open = el('button', 'link', 'Open');
+  open.onclick = () => watch(s.id);
+  row.append(open);
+  c.append(row);
+  return c;
+}
+
+function renderInbox() {
+  const list = waitingList();
+  $('inbox').hidden = !list.length;
+  $('inbox').replaceChildren(...list.map(card));
+  renderTitle();
+}
+
+// The ages move on their own.
+setInterval(() => {
+  if (state.view === 'list' && !document.hidden) renderInbox();
+}, 15000);
+
 function renderList() {
+  renderInbox();
   if (!state.listed && state.pc && (state.link === 'connecting' || state.link === 'online')) {
     $('groups').replaceChildren(...skeleton());
     $('empty').hidden = true;

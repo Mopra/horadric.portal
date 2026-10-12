@@ -1,6 +1,6 @@
 // Keeps the page openable without a network, and always prefers a fresh
 // copy when there is one, so an update reaches the phone at once.
-const CACHE = 'horadric-portal-v9';
+const CACHE = 'horadric-portal-v10';
 const SHELL = ['/', '/index.html', '/app.js', '/style.css', '/manifest.webmanifest', '/icon.png', '/icon-256.png'];
 
 self.addEventListener('install', (ev) => {

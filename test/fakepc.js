@@ -88,8 +88,15 @@ function startSession(path, reply) {
 const sessions = [
   { id: 's1', name: 'relay', project: 'horadric.portal', phase: 'waiting', line: 'Bash: npm test' },
   { id: 's2', name: 'ui', project: 'horadric.dev', phase: 'working', line: 'Editing app.rs' },
+  { id: 's4', name: 'pick', project: 'horadric.dev', phase: 'waiting', line: 'Question' },
   { id: 's3', name: 'docs', project: 'horadric.dev', phase: 'idle', line: '', paused: true },
 ];
+// What the waiting ones ask, as the PC's `ask` has it.
+const asks = {
+  s1: { kind: 'permission', tool: 'Bash', detail: 'npm test', options: [{ label: 'Allow', keys: '1' }, { label: 'Always', keys: '2' }, { label: 'Deny', keys: '3' }] },
+  s4: { kind: 'question', tool: 'AskUserQuestion', detail: 'Which database?', options: [{ label: 'SQLite', keys: '1' }, { label: 'Postgres', keys: '2' }] },
+};
+for (const [sid, ask] of Object.entries(asks)) sessions.find((x) => x.id === sid).ask = { ...ask, since: Math.floor(Date.now() / 1000) - 90 };
 const screens = {};
 for (const s of sessions) {
   screens[s.id] = [`Session ${s.name}`, ''.padEnd(100, '-'), ...Array.from({ length: 40 }, (_, i) => `line ${i} of ${s.name}`), '> '];
@@ -166,6 +173,14 @@ function start() {
     } else if (msg.t === 'input') {
       const lines = screens[msg.id];
       if (!lines) return;
+      const asked = sessions.find((x) => x.id === msg.id);
+      if (asked && asked.ask && /^[0-9]$/.test(msg.data)) {
+        setTimeout(() => {
+          asked.phase = 'working';
+          delete asked.ask;
+          broadcast({ t: 'sessions', list: sessions });
+        }, 1500);
+      }
       const shown = JSON.stringify(msg.data);
       if (msg.data === '\r') lines.push('> ');
       else lines[lines.length - 1] += msg.data.length === 1 && msg.data >= ' ' ? msg.data : msg.data.length > 1 && !msg.data.startsWith('\u001b') ? msg.data : shown;
