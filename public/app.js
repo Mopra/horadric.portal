@@ -143,6 +143,7 @@ const state = {
   tooOld: false,
   view: 'list', // unpaired | list | projects | session
   folders: null, // the PC's folders answer, null until it comes
+  listed: false, // a sessions answer came from this PC, so the list is real
 };
 
 function setLink(link) {
@@ -153,6 +154,7 @@ function setLink(link) {
   lamp.className = 'lamp ' + (link === 'online' ? 'online' : link === 'connecting' ? 'connecting' : 'offline');
   label.textContent = words[link];
   renderNote();
+  renderList();
 }
 
 // Connection
@@ -352,6 +354,7 @@ function onMessage(msg) {
       renderFolders();
       break;
     case 'sessions':
+      state.listed = true;
       state.sessions = Array.isArray(msg.list) ? msg.list : [];
       renderList();
       renderTitle();
@@ -465,7 +468,32 @@ function el(tag, cls, text) {
   return e;
 }
 
+// Grey rows in the shape of the list, while the first answer is on its way,
+// so connecting looks like loading and not like a PC with nothing on it.
+function skeleton() {
+  const out = [];
+  for (const rows of [2, 1]) {
+    const sec = el('section', 'group skeleton');
+    sec.setAttribute('aria-hidden', 'true');
+    sec.append(el('div', 'bone head'));
+    for (let i = 0; i < rows; i++) {
+      const row = el('div', 'sess');
+      const what = el('div', 'what');
+      what.append(el('div', 'bone name'), el('div', 'bone line'));
+      row.append(el('i', 'lamp'), what);
+      sec.append(row);
+    }
+    out.push(sec);
+  }
+  return out;
+}
+
 function renderList() {
+  if (!state.listed && state.pc && (state.link === 'connecting' || state.link === 'online')) {
+    $('groups').replaceChildren(...skeleton());
+    $('empty').hidden = true;
+    return;
+  }
   const out = [];
   for (const g of grouped()) {
     const sec = el('section', 'group');
@@ -828,10 +856,47 @@ function renderScreen() {
 
 // Navigation
 
+// How deep a view sits, so going deeper slides in from the right and back
+// slides the other way.
+const DEPTH = { unpaired: 0, list: 0, projects: 1, session: 1 };
+const still = matchMedia('(prefers-reduced-motion: reduce)');
+
 function show(view) {
+  const from = state.view;
   state.view = view;
+  const leaving = from !== view && !$(from).hidden ? $(from) : null;
+  // Measured while it still shows, since hidden it has no size.
+  const where = leaving && leaving.getBoundingClientRect();
   for (const v of ['unpaired', 'list', 'projects', 'session']) $(v).hidden = v !== view;
   $('back').hidden = view !== 'session' && view !== 'projects';
+  if (leaving) slide(leaving, where, $(view), DEPTH[view] < DEPTH[from] ? 'back' : 'fwd');
+}
+
+// The view going away is pinned where it was and slides out while the new
+// one slides in, so both move together for a moment. A timer ends it, not
+// animationend, which a page in the background may never get.
+const SLIDE_MS = 240;
+function slide(out, where, into, way) {
+  clearTimeout(slide.timer);
+  settle();
+  if (still.matches) return;
+  if (where.height) {
+    out.hidden = false;
+    out.style.top = where.top + 'px';
+    out.style.height = where.height + 'px';
+    out.classList.add('leaving', way);
+  }
+  void into.offsetWidth;
+  into.classList.add('entering', way);
+  slide.timer = setTimeout(settle, SLIDE_MS + 60);
+}
+
+function settle() {
+  for (const v of document.querySelectorAll('.view.leaving, .view.entering')) {
+    v.classList.remove('leaving', 'entering', 'fwd', 'back');
+    v.style.top = v.style.height = '';
+    v.hidden = state.view !== v.id;
+  }
 }
 
 function watch(id) {
@@ -872,6 +937,7 @@ function choose(pc) {
   state.watching = null;
   state.tooOld = false;
   state.folders = null;
+  state.listed = false;
   if (pc) localStorage.setItem('horadric.current', pc.id);
   renderPcs();
   renderTitle();
@@ -886,6 +952,17 @@ function choose(pc) {
 
 // Input
 
+// A short tick where the phone can vibrate: one for a message sent, a
+// double one for an answer to what the agent asked. iOS has no vibrate and
+// stays silent.
+const TICK = { send: 12, answer: [12, 60, 12] };
+function haptic(kind) {
+  if (navigator.vibrate) navigator.vibrate(TICK[kind]);
+}
+
+// The keys that answer a waiting agent: a choice's digit, yes or no.
+const isAnswer = (k) => /^[0-9yn]$/.test(k);
+
 function typeInto(data) {
   if (!state.watching) return;
   send({ t: 'input', id: state.watching, data });
@@ -894,6 +971,7 @@ function typeInto(data) {
 $('keys').addEventListener('click', (ev) => {
   const b = ev.target.closest('button');
   if (!b || !b.dataset.k) return;
+  haptic(isAnswer(b.dataset.k) ? 'answer' : 'send');
   typeInto(b.dataset.k);
 });
 
@@ -970,6 +1048,7 @@ screenwrap.addEventListener('wheel', (ev) => {
 $('send').addEventListener('submit', (ev) => {
   ev.preventDefault();
   const text = $('text').value;
+  haptic('send');
   if (!text) return typeInto('\r');
   typeInto(text);
   // Enter apart from the text, so the agent sees typing then a key, not a
