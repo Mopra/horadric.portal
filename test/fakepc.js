@@ -86,7 +86,7 @@ function startSession(path, reply) {
 }
 
 const sessions = [
-  { id: 's1', name: 'relay', project: 'horadric.portal', phase: 'waiting', line: 'Bash: npm test' },
+  { id: 's1', name: 'relay', project: 'horadric.portal', phase: 'waiting', line: 'Bash: npm test', ask: { kind: 'permission', tool: 'Bash', options: [{ label: 'Yes', keys: '1' }, { label: 'No', keys: '2' }] } },
   { id: 's2', name: 'ui', project: 'horadric.dev', phase: 'working', line: 'Editing app.rs' },
   { id: 's3', name: 'docs', project: 'horadric.dev', phase: 'idle', line: '', paused: true },
 ];

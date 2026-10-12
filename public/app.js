@@ -412,9 +412,22 @@ function renderNote() {
   note.textContent = text;
 }
 
+// Esc, Ctrl+C, arrows and Tab always fit. y, n and the digits answer a
+// prompt, so they show only while the session waits, and the digits only as
+// many as its `ask` has options (1 to 3 when an older PC sends no `ask`).
+function renderKeys(s) {
+  const waiting = !!s && phaseOf(s) === 'waiting';
+  const options = s && s.ask && Array.isArray(s.ask.options) ? s.ask.options.length : 3;
+  for (const b of $('keys').querySelectorAll('[data-answer]')) {
+    const k = b.dataset.k;
+    b.hidden = !waiting || (/^[0-9]$/.test(k) && Number(k) > options);
+  }
+}
+
 function renderTitle() {
   if (state.watching) {
     const s = state.sessions.find((x) => x.id === state.watching);
+    renderKeys(s);
     $('title').textContent = s ? s.name : 'Session';
   } else if (state.view === 'projects') {
     $('title').textContent = 'Open project';
