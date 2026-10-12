@@ -1,8 +1,9 @@
 // A stand-in for Horadric's PC side, to try the relay and the page without
 // a PC: node test/fakepc.js [relay ws url]. It prints a pairing link,
 // answers hello, lists sessions, projects and folders, starts and makes
-// projects, and echoes what the phone types into
-// the watched session's screen.
+// projects, takes photos, renames and stops sessions, answers their last
+// reply, echoes what the phone types into the watched session's screen,
+// and streams output into the working one.
 'use strict';
 const crypto = require('crypto');
 const os = require('os');
@@ -86,7 +87,7 @@ function startSession(path, reply) {
 }
 
 const sessions = [
-  { id: 's1', name: 'relay', project: 'horadric.portal', phase: 'waiting', line: 'Bash: npm test' },
+  { id: 's1', name: 'relay', project: 'horadric.portal', phase: 'waiting', line: 'Bash: npm test', ask: { kind: 'permission', tool: 'Bash', options: [{ label: 'Yes', keys: '1' }, { label: 'No', keys: '2' }] } },
   { id: 's2', name: 'ui', project: 'horadric.dev', phase: 'working', line: 'Editing app.rs' },
   { id: 's3', name: 'docs', project: 'horadric.dev', phase: 'idle', line: '', paused: true },
 ];
@@ -180,6 +181,11 @@ function start() {
       const path = `${root.path}\\${name}`;
       root.list.unshift({ path, name, git: true });
       startSession(path, reply);
+    } else if (msg.t === 'attach') {
+      const bytes = Buffer.from(msg.data || '', 'base64url');
+      console.log(`attach ${msg.name}: ${bytes.length} bytes for ${msg.id}`);
+      const path = ['C:', 'Users', 'me', 'AppData', 'Roaming', 'Horadric', 'portal-attach', msg.id, `${Math.floor(Date.now() / 1000)}-${msg.name}`].join('\\');
+      setTimeout(() => reply({ t: 'attached', id: msg.id, name: msg.name, path }), 300);
     } else if (msg.t === 'resume') {
       const s = sessions.find((x) => x.id === msg.id);
       if (!s) return reply({ t: 'error', text: 'No such session' });
@@ -194,6 +200,20 @@ function start() {
       const files = changed[msg.id] || [];
       if (!files.some((f) => f.path === msg.path)) return reply({ t: 'error', text: 'That file has no changes now.' });
       reply({ t: 'diff', id: msg.id, path: msg.path, text: diffs[msg.path] || '', cut: msg.path === 'Cargo.lock' });
+    } else if (msg.t === 'rename') {
+      const s = sessions.find((x) => x.id === msg.id);
+      if (!s) return reply({ t: 'error', text: 'That session is gone.' });
+      s.name = String(msg.name || '').trim() || `claude ${s.id}`;
+      broadcast({ t: 'sessions', list: sessions });
+    } else if (msg.t === 'stop') {
+      const at = sessions.findIndex((x) => x.id === msg.id);
+      if (at < 0) return reply({ t: 'error', text: 'That session is gone.' });
+      sessions.splice(at, 1);
+      broadcast({ t: 'sessions', list: sessions });
+    } else if (msg.t === 'reply') {
+      const s = sessions.find((x) => x.id === msg.id);
+      const text = s && s.id !== 's3' ? `Done with ${s.name}.\n\nAll 42 tests pass. Want me to ship it?` : null;
+      setTimeout(() => reply({ t: 'reply', id: msg.id, text }), 400);
     } else if (msg.t === 'push') {
       subs.set(msg.sub.endpoint, msg.sub);
       console.log('push subscription', msg.sub.endpoint.slice(0, 60));
@@ -253,6 +273,18 @@ function sendScreen(ch, sid) {
   if (!lines) return ws.send(R.frame(ch, seal({ t: 'error', text: 'No such session' })));
   ws.send(R.frame(ch, seal({ t: 'screen', id: sid, cols: 100, rows: 30, lines, cursor: [lines.length - 1, lines[lines.length - 1].length] })));
 }
+
+// The working session prints a line every half second, and its oldest
+// lines fall off past 80 the way a real PC's do past 500, to try how the
+// page keeps the view still while output streams in.
+let printed = 0;
+setInterval(() => {
+  const lines = screens.s2;
+  const prompt = lines.pop();
+  lines.push(`output ${++printed} at ${new Date().toLocaleTimeString()}`, prompt);
+  if (lines.length > 80) lines.splice(0, lines.length - 80);
+  for (const [ch, sid] of watching) if (sid === 's2') sendScreen(ch, sid);
+}, 500).unref();
 
 // Phases change now and then, as on a real PC.
 setInterval(() => {

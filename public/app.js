@@ -54,10 +54,14 @@ function pairWith(fragment) {
   return true;
 }
 
-// Take the link from the address bar, then wipe it from there.
+// Take the link from the address bar, then wipe it from there. A
+// notification's link, #s=<session>&pc=<pc>, is kept in `state.open` for
+// the page to show that session.
 function takeFragment() {
   if (location.hash.length < 2) return;
-  pairWith(location.hash);
+  const p = new URLSearchParams(location.hash.slice(1));
+  if (p.get('s')) state.open = { id: p.get('s'), pc: p.get('pc') || '' };
+  else pairWith(location.hash);
   history.replaceState(null, '', location.pathname);
 }
 
@@ -122,6 +126,7 @@ async function open(key, buf) {
 
 const state = {
   pc: null,
+  open: null, // the session a notification asked to show, {id, pc}
   key: null,
   ws: null,
   link: 'connecting', // connecting | offline (relay down) | pcoff | online
@@ -149,6 +154,9 @@ const state = {
   diffPath: null, // the file whose diff is shown
   diff: null, // the PC's diff answer for it
   diffError: null,
+  sheet: null, // the long press menu, see openSheet
+  replyWait: null, // { id, resolve, reject, timer } while a reply is asked for
+  listed: false, // a sessions answer came from this PC, so the list is real
 };
 
 function setLink(link) {
@@ -159,6 +167,7 @@ function setLink(link) {
   lamp.className = 'lamp ' + (link === 'online' ? 'online' : link === 'connecting' ? 'connecting' : 'offline');
   label.textContent = words[link];
   renderNote();
+  renderList();
 }
 
 // Connection
@@ -360,9 +369,13 @@ function onMessage(msg) {
       renderFolders();
       break;
     case 'sessions':
+      state.listed = true;
       state.sessions = Array.isArray(msg.list) ? msg.list : [];
       renderList();
       renderTitle();
+      renderBadge();
+      // A rename being typed must not be reset by an update.
+      if (state.sheet && (state.sheet.mode !== 'rename' || !state.sessions.some((s) => s.id === state.sheet.id))) renderSheet();
       // A turn that ends or starts waiting has likely changed files.
       if (state.watching) {
         const s = state.sessions.find((x) => x.id === state.watching);
@@ -370,6 +383,9 @@ function onMessage(msg) {
         if (phase !== state.watchedPhase) askChanges();
         state.watchedPhase = phase;
       }
+      break;
+    case 'reply':
+      gotReply(msg);
       break;
     case 'changes':
       if (msg.id === state.watching) {
@@ -391,7 +407,11 @@ function onMessage(msg) {
         renderScreen();
       }
       break;
+    case 'attached':
+      attached(msg);
+      break;
     case 'error':
+      if (state.attaching) attachDone();
       if (msg.code === 'used' || msg.code === 'expired') {
         codeFailed(msg.text, msg.code === 'used');
         break;
@@ -432,17 +452,38 @@ function renderNote() {
   note.textContent = text;
 }
 
+// Esc, Ctrl+C, arrows and Tab always fit. y, n and the digits answer a
+// prompt, so they show only while the session waits, and the digits only as
+// many as its `ask` has options (1 to 3 when an older PC sends no `ask`).
+function renderKeys(s) {
+  const waiting = !!s && phaseOf(s) === 'waiting';
+  const options = s && s.ask && Array.isArray(s.ask.options) ? s.ask.options.length : 3;
+  for (const b of $('keys').querySelectorAll('[data-answer]')) {
+    const k = b.dataset.k;
+    b.hidden = !waiting || (/^[0-9]$/.test(k) && Number(k) > options);
+  }
+}
+
 function renderTitle() {
   if (state.view === 'diff') {
     $('title').textContent = baseName(state.diffPath || '') || 'Changes';
   } else if (state.watching) {
     const s = state.sessions.find((x) => x.id === state.watching);
+    renderKeys(s);
     $('title').textContent = s ? s.name : 'Session';
   } else if (state.view === 'projects') {
     $('title').textContent = 'Open project';
   } else {
     $('title').textContent = state.pc ? state.pc.n : 'Horadric';
   }
+}
+
+// The app icon's count of sessions waiting, as the pushes set it while the
+// page is shut. Where the browser has no badge, nothing.
+function renderBadge() {
+  if (!navigator.setAppBadge) return;
+  const n = state.sessions.filter((s) => s.phase === 'waiting').length;
+  (n ? navigator.setAppBadge(n) : navigator.clearAppBadge()).catch(() => {});
 }
 
 function renderPcs() {
@@ -500,7 +541,32 @@ function el(tag, cls, text) {
   return e;
 }
 
+// Grey rows in the shape of the list, while the first answer is on its way,
+// so connecting looks like loading and not like a PC with nothing on it.
+function skeleton() {
+  const out = [];
+  for (const rows of [2, 1]) {
+    const sec = el('section', 'group skeleton');
+    sec.setAttribute('aria-hidden', 'true');
+    sec.append(el('div', 'bone head'));
+    for (let i = 0; i < rows; i++) {
+      const row = el('div', 'sess');
+      const what = el('div', 'what');
+      what.append(el('div', 'bone name'), el('div', 'bone line'));
+      row.append(el('i', 'lamp'), what);
+      sec.append(row);
+    }
+    out.push(sec);
+  }
+  return out;
+}
+
 function renderList() {
+  if (!state.listed && state.pc && (state.link === 'connecting' || state.link === 'online')) {
+    $('groups').replaceChildren(...skeleton());
+    $('empty').hidden = true;
+    return;
+  }
   const out = [];
   for (const g of grouped()) {
     const sec = el('section', 'group');
@@ -537,6 +603,7 @@ function renderList() {
         b.append(r);
       }
       b.onclick = () => watch(s.id);
+      holdable(b, () => openSheet(s.id));
       sec.append(b);
     }
     if (!g.list.length && !startingHere) sec.append(el('div', 'dim none', 'No sessions'));
@@ -748,7 +815,13 @@ async function resendPush() {
   } catch {}
 }
 
+// The screen's text size is kept as an offset from the base size, so a
+// size saved before pinching (whole steps from the A buttons) still reads.
+const BASE_TEXT = 13;
+const MIN_TEXT = 8;
+const MAX_TEXT = 28;
 let zoom = Number(localStorage.getItem('horadric.textzoom')) || 0;
+const textSize = () => Math.max(MIN_TEXT, Math.min(MAX_TEXT, BASE_TEXT + zoom));
 
 // A PC terminal is 150 columns or more and a phone fits about 45 readable
 // ones. Shrinking the PC's width to the phone made text too small to read,
@@ -834,26 +907,78 @@ function cellWidth(pre) {
   return ctx.measureText('M'.repeat(20)).width / 20 || 8;
 }
 
+// How far from the bottom still counts as following the output.
+const NEAR = 40;
+const atBottom = (wrap) => wrap.scrollHeight - wrap.scrollTop - wrap.clientHeight < NEAR;
+
+// How many lines fell off the top between two frames. Once the PC's 500
+// lines of scrollback are full, new output pushes old lines out, and
+// matching the new first lines against the old ones finds by how many,
+// so the rest keep their nodes instead of every line being redrawn.
+function dropped(old, lines) {
+  if (!old.length || !lines.length || old[0] === lines[0]) return 0;
+  const run = Math.min(8, lines.length);
+  for (let k = 1; k < old.length; k++) {
+    let m = 0;
+    while (m < run && k + m < old.length && old[k + m] === lines[m]) m++;
+    if (m === run || (m > 0 && k + m === old.length)) return k;
+  }
+  return 0;
+}
+
+// The screen is one div per line, and a frame changes only the lines
+// whose HTML differs, so a selection and the scroll position survive the
+// four updates a second. The HTML of each shown line is kept here.
+let shown = [];
+
 function renderScreen() {
   const sc = state.screen;
   const pre = $('screen');
   const wrap = $('screenwrap');
-  const atBottom = wrap.scrollHeight - wrap.scrollTop - wrap.clientHeight < 40;
-  const size = Math.max(9, Math.min(22, 13 + zoom));
-  pre.style.fontSize = size + 'px';
+  const follow = atBottom(wrap) || !renderScreen.seen;
+  pre.style.fontSize = textSize() + 'px';
+  // Whole pixel lines, since the browser rounds scrollTop and keeping the
+  // view still adds up line heights a frame at a time.
+  pre.style.lineHeight = Math.round(textSize() * 1.3) + 'px';
   const cols = Math.max(20, Math.floor((pre.clientWidth - 12) / cellWidth(pre)));
   if (sc) {
     // A PC before colours sends no styles, and its lines draw plain.
     const styles = sc.styles || [];
-    pre.innerHTML = (sc.lines || [])
-      .map((l, i) => lineHtml(fitLine(cells(l, styles[i]), cols), styles[i]))
-      .join('\n');
+    const html = (sc.lines || []).map((l, i) => lineHtml(fitLine(cells(l, styles[i]), cols), styles[i]));
+    if (!shown.length) pre.textContent = '';
+    // Where the reader is looking, to put it back after the change.
+    const anchor = follow ? null : firstVisible(pre, wrap);
+    const offset = anchor ? anchor.getBoundingClientRect().top : 0;
+    let lost = 0;
+    const k = dropped(shown, html);
+    for (let i = 0; i < k; i++) {
+      lost += pre.firstChild.offsetHeight;
+      pre.firstChild.remove();
+    }
+    shown = shown.slice(k);
+    const rows = pre.children;
+    html.forEach((h, i) => {
+      if (i < shown.length) {
+        if (shown[i] !== h) rows[i].innerHTML = h;
+      } else {
+        const div = document.createElement('div');
+        div.innerHTML = h;
+        pre.appendChild(div);
+      }
+    });
+    while (rows.length > html.length) pre.lastChild.remove();
+    shown = html;
+    // Measured to the subpixel, since rounded offsets drift a pixel a frame.
+    if (anchor && anchor.isConnected) wrap.scrollTop += anchor.getBoundingClientRect().top - offset;
+    else if (!follow) wrap.scrollTop -= lost;
   } else {
+    shown = [];
     pre.textContent = state.paused ? 'This session is paused.' : 'Waiting for the screen...';
   }
   $('resumebar').hidden = !state.paused;
-  if (atBottom || !renderScreen.seen) wrap.scrollTop = wrap.scrollHeight;
+  if (follow) wrap.scrollTop = wrap.scrollHeight;
   renderScreen.seen = true;
+  renderLatest();
 }
 
 // What changed
@@ -939,7 +1064,7 @@ function renderDiff() {
   const f = (state.changes || []).find((x) => x.path === path);
   $('diffpath').replaceChildren(el('span', 'dir', path), ...(f ? [countsEl(f)] : []));
   const body = $('diffbody');
-  body.style.fontSize = Math.max(9, Math.min(22, 13 + zoom)) + 'px';
+  body.style.fontSize = textSize() + 'px';
   const d = state.diff;
   if (!d) {
     body.replaceChildren(el('p', 'dim center', state.diffError || 'Asking the PC...'));
@@ -969,12 +1094,334 @@ $('changesum').onclick = () => {
   if (state.changesOpen) askChanges();
 };
 
+// The first line at least partly in view, found by halving since a long
+// session has hundreds.
+function firstVisible(pre, wrap) {
+  const rows = pre.children;
+  const top = wrap.scrollTop;
+  let lo = 0;
+  let hi = rows.length - 1;
+  if (hi < 0) return null;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    const r = rows[mid];
+    if (r.offsetTop + r.offsetHeight <= top) lo = mid + 1;
+    else hi = mid;
+  }
+  return rows[lo];
+}
+
+function renderLatest() {
+  $('latest').hidden = !state.screen || atBottom($('screenwrap'));
+}
+
+$('screenwrap').addEventListener('scroll', renderLatest, { passive: true });
+$('latest').onclick = () => {
+  const wrap = $('screenwrap');
+  wrap.scrollTop = wrap.scrollHeight;
+  renderLatest();
+};
+
+// Long press a session: rename, stop, copy its last reply
+
+const HOLD_MS = 500;
+const HOLD_SLOP = 10;
+
+// The click a browser may send when a held finger lifts lands on whatever
+// is under it by then, which is the sheet the hold opened. So after a hold
+// the next click anywhere is eaten, until shortly after the finger is up.
+const swallow = { holding: false, until: 0 };
+document.addEventListener(
+  'pointerup',
+  () => {
+    if (!swallow.holding) return;
+    swallow.holding = false;
+    swallow.until = Date.now() + 400;
+  },
+  true,
+);
+document.addEventListener(
+  'click',
+  (ev) => {
+    if (!swallow.holding && Date.now() > swallow.until) return;
+    swallow.holding = false;
+    swallow.until = 0;
+    ev.stopImmediatePropagation();
+    ev.preventDefault();
+  },
+  true,
+);
+
+// Calls `fn` when `target` is held still for HOLD_MS. A right click does
+// the same on a desktop, and Android's own long press arrives as
+// contextmenu too.
+function holdable(target, fn) {
+  let timer = null;
+  let from = null;
+  let held = false;
+  const cancel = () => {
+    clearTimeout(timer);
+    timer = null;
+  };
+  const fire = () => {
+    cancel();
+    held = true;
+    swallow.holding = true;
+    if (navigator.vibrate) navigator.vibrate(10);
+    fn();
+  };
+  target.addEventListener('pointerdown', (ev) => {
+    if (ev.button > 0) return;
+    held = false;
+    from = [ev.clientX, ev.clientY];
+    cancel();
+    timer = setTimeout(fire, HOLD_MS);
+  });
+  target.addEventListener('pointermove', (ev) => {
+    if (timer && Math.hypot(ev.clientX - from[0], ev.clientY - from[1]) > HOLD_SLOP) cancel();
+  });
+  for (const t of ['pointerup', 'pointercancel', 'pointerleave']) target.addEventListener(t, cancel);
+  target.addEventListener('contextmenu', (ev) => {
+    ev.preventDefault();
+    if (held) return;
+    fire();
+    // A right click has had its pointerup already, and sends no click.
+    if (ev.button === 2 && !ev.sourceCapabilities?.firesTouchEvents) swallow.holding = false;
+  });
+}
+
+// sheet: { id, mode: menu | rename | stop | reply, text, copied }
+function openSheet(id) {
+  if (!state.sessions.some((s) => s.id === id)) return;
+  if (state.sheet && state.sheet.id === id) return;
+  state.sheet = { id, mode: 'menu' };
+  renderSheet();
+}
+
+function closeSheet() {
+  state.sheet = null;
+  if (state.replyWait) {
+    clearTimeout(state.replyWait.timer);
+    state.replyWait.reject();
+    state.replyWait = null;
+  }
+  $('sheet').hidden = true;
+}
+
+function sheetButton(label, cls, onclick) {
+  const b = el('button', 'sheetbtn' + (cls ? ' ' + cls : ''), label);
+  b.type = 'button';
+  b.onclick = onclick;
+  return b;
+}
+
+function renderSheet() {
+  const sh = state.sheet;
+  if (!sh) return closeSheet();
+  const s = state.sessions.find((x) => x.id === sh.id);
+  if (!s) return closeSheet();
+  const name = s.name || s.id;
+  const online = state.link === 'online';
+  $('sheettitle').textContent = name;
+  const body = [];
+  if (sh.mode === 'menu') {
+    const actions = [
+      sheetButton('Rename', null, () => {
+        sh.mode = 'rename';
+        renderSheet();
+      }),
+      sheetButton('Copy last reply', null, copyReply),
+      sheetButton('Stop', 'danger', () => {
+        sh.mode = 'stop';
+        renderSheet();
+      }),
+    ];
+    for (const a of actions) a.disabled = !online;
+    body.push(...actions);
+  } else if (sh.mode === 'rename') {
+    const form = el('form', 'sheetform');
+    const input = el('input');
+    input.id = 'rename';
+    input.value = name;
+    input.maxLength = 80;
+    input.autocomplete = 'off';
+    input.setAttribute('enterkeyhint', 'done');
+    const save = sheetButton('Rename', 'gold');
+    save.type = 'submit';
+    form.append(input, el('p', 'dim', 'Leave it empty and Claude names it again.'), save);
+    form.onsubmit = (ev) => {
+      ev.preventDefault();
+      rename(s.id, input.value.trim());
+    };
+    body.push(form);
+    setTimeout(() => {
+      input.focus();
+      input.select();
+    }, 50);
+  } else if (sh.mode === 'stop') {
+    body.push(
+      el('p', 'sheettext', 'Stop this session? Its agent is ended on the PC and its tile goes, as closing its pane does.'),
+      sheetButton('Stop session', 'danger', () => stopSession(s.id)),
+    );
+  } else if (sh.mode === 'reply') {
+    if (sh.none) {
+      body.push(el('p', 'sheettext', sh.none));
+    } else if (sh.text == null) {
+      const row = el('div', 'sheetwait');
+      row.append(el('i', 'spinner'), el('span', null, 'Getting the last reply...'));
+      body.push(row);
+    } else {
+      body.push(el('pre', 'reply', sh.text));
+      body.push(
+        sheetButton(sh.copied ? 'Copied' : 'Copy', sh.copied ? 'done' : 'gold', async () => {
+          sh.copied = await copyText(sh.text);
+          renderSheet();
+        }),
+      );
+    }
+  }
+  body.push(sheetButton(sh.mode === 'reply' ? 'Close' : 'Cancel', 'quiet', closeSheet));
+  $('sheetbody').replaceChildren(...body);
+  $('sheet').hidden = false;
+}
+
+async function copyText(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// The reply comes over the network, after the tap's moment has passed,
+// and Safari copies only within a tap. A ClipboardItem may hold a promise
+// of its text, so the copy starts with the tap and finishes on the
+// answer. Where that fails, the reply shows with a Copy button.
+function copyReply() {
+  const sh = state.sheet;
+  sh.mode = 'reply';
+  sh.text = null;
+  sh.none = null;
+  sh.copied = false;
+  const id = sh.id;
+  const answer = new Promise((resolve, reject) => {
+    state.replyWait = {
+      id,
+      resolve,
+      reject,
+      timer: setTimeout(() => {
+        state.replyWait = null;
+        reject();
+        if (state.sheet && state.sheet.id === id) {
+          state.sheet.none = 'The PC did not answer. Copying a reply needs a newer Horadric on the PC.';
+          renderSheet();
+        }
+      }, 8000),
+    };
+  });
+  answer.catch(() => {});
+  if (window.ClipboardItem && navigator.clipboard && navigator.clipboard.write) {
+    const blob = answer.then((t) => (t == null ? Promise.reject() : new Blob([t], { type: 'text/plain' })));
+    navigator.clipboard
+      .write([new ClipboardItem({ 'text/plain': blob })])
+      .then(() => {
+        if (state.sheet && state.sheet.id === id) {
+          state.sheet.copied = true;
+          renderSheet();
+        }
+      })
+      .catch(() => {});
+  }
+  send({ t: 'reply', id });
+  renderSheet();
+}
+
+function gotReply(msg) {
+  const w = state.replyWait;
+  if (!w || w.id !== msg.id) return;
+  clearTimeout(w.timer);
+  state.replyWait = null;
+  const text = typeof msg.text === 'string' && msg.text ? msg.text : null;
+  w.resolve(text);
+  const sh = state.sheet;
+  if (!sh || sh.id !== msg.id) return;
+  if (text == null) sh.none = 'This session has no reply yet.';
+  sh.text = text;
+  renderSheet();
+}
+
+// An older PC ignores these, so the page says so if nothing comes of them.
+function rename(id, name) {
+  closeSheet();
+  send({ t: 'rename', id, name });
+  if (!name) return;
+  setTimeout(() => {
+    const s = state.sessions.find((x) => x.id === id);
+    if (s && s.name !== name) say('The PC did not rename it. Renaming from the phone needs a newer Horadric on the PC.');
+  }, 6000);
+}
+
+function stopSession(id) {
+  closeSheet();
+  send({ t: 'stop', id });
+  if (state.watching === id) history.back();
+  setTimeout(() => {
+    if (state.sessions.some((x) => x.id === id)) say('The PC did not stop it. Stopping from the phone needs a newer Horadric on the PC.');
+  }, 8000);
+}
+
+holdable($('title'), () => state.watching && openSheet(state.watching));
+$('sheet').addEventListener('click', (ev) => {
+  if (ev.target === $('sheet')) closeSheet();
+});
+document.addEventListener('keydown', (ev) => {
+  if (ev.key === 'Escape' && state.sheet) closeSheet();
+});
+
 // Navigation
 
+// How deep a view sits, so going deeper slides in from the right and back
+// slides the other way.
+const DEPTH = { unpaired: 0, list: 0, projects: 1, session: 1, diff: 2 };
+const still = matchMedia('(prefers-reduced-motion: reduce)');
+
 function show(view) {
+  const from = state.view;
   state.view = view;
+  const leaving = from !== view && !$(from).hidden ? $(from) : null;
+  // Measured while it still shows, since hidden it has no size.
+  const where = leaving && leaving.getBoundingClientRect();
   for (const v of ['unpaired', 'list', 'projects', 'session', 'diff']) $(v).hidden = v !== view;
   $('back').hidden = view !== 'session' && view !== 'projects' && view !== 'diff';
+  if (leaving) slide(leaving, where, $(view), DEPTH[view] < DEPTH[from] ? 'back' : 'fwd');
+}
+
+// The view going away is pinned where it was and slides out while the new
+// one slides in, so both move together for a moment. A timer ends it, not
+// animationend, which a page in the background may never get.
+const SLIDE_MS = 240;
+function slide(out, where, into, way) {
+  clearTimeout(slide.timer);
+  settle();
+  if (still.matches) return;
+  if (where.height) {
+    out.hidden = false;
+    out.style.top = where.top + 'px';
+    out.style.height = where.height + 'px';
+    out.classList.add('leaving', way);
+  }
+  void into.offsetWidth;
+  into.classList.add('entering', way);
+  slide.timer = setTimeout(settle, SLIDE_MS + 60);
+}
+
+function settle() {
+  for (const v of document.querySelectorAll('.view.leaving, .view.entering')) {
+    v.classList.remove('leaving', 'entering', 'fwd', 'back');
+    v.style.top = v.style.height = '';
+    v.hidden = state.view !== v.id;
+  }
 }
 
 function watch(id) {
@@ -1017,6 +1464,7 @@ function unwatch() {
 }
 
 function choose(pc) {
+  closeSheet();
   state.pc = pc;
   state.sessions = [];
   state.projects = [];
@@ -1029,6 +1477,7 @@ function choose(pc) {
   state.changes = null;
   state.diffPath = null;
   state.diff = null;
+  state.listed = false;
   if (pc) localStorage.setItem('horadric.current', pc.id);
   renderPcs();
   renderTitle();
@@ -1043,6 +1492,17 @@ function choose(pc) {
 
 // Input
 
+// A short tick where the phone can vibrate: one for a message sent, a
+// double one for an answer to what the agent asked. iOS has no vibrate and
+// stays silent.
+const TICK = { send: 12, answer: [12, 60, 12] };
+function haptic(kind) {
+  if (navigator.vibrate) navigator.vibrate(TICK[kind]);
+}
+
+// The keys that answer a waiting agent: a choice's digit, yes or no.
+const isAnswer = (k) => /^[0-9yn]$/.test(k);
+
 function typeInto(data) {
   if (!state.watching) return;
   send({ t: 'input', id: state.watching, data });
@@ -1051,23 +1511,84 @@ function typeInto(data) {
 $('keys').addEventListener('click', (ev) => {
   const b = ev.target.closest('button');
   if (!b || !b.dataset.k) return;
+  haptic(isAnswer(b.dataset.k) ? 'answer' : 'send');
   typeInto(b.dataset.k);
 });
 
-$('zoomin').onclick = () => {
-  zoom += 1;
-  localStorage.setItem('horadric.textzoom', zoom);
+// Pinching the screen sizes its text. The text rewraps at every size, so
+// the anchor is how far down the content the fingers' midpoint sits, which
+// rewrapping keeps roughly where it was.
+const pinch = { from: 0, size: 0, at: 0, y: 0, frame: 0 };
+
+function fingers(ev) {
+  const [a, b] = ev.touches;
+  return { gap: Math.hypot(a.clientX - b.clientX, a.clientY - b.clientY), y: (a.clientY + b.clientY) / 2 };
+}
+
+function zoomTo(size, y) {
+  const wrap = $('screenwrap');
+  const top = y - wrap.getBoundingClientRect().top;
+  const at = (wrap.scrollTop + top) / (wrap.scrollHeight || 1);
+  zoom = Math.max(MIN_TEXT, Math.min(MAX_TEXT, size)) - BASE_TEXT;
   renderScreen();
-};
-$('zoomout').onclick = () => {
-  zoom -= 1;
+  wrap.scrollTop = at * wrap.scrollHeight - top;
+}
+
+// Settles on a half pixel, so the size kept is one the page draws again.
+function saveZoom(size, y) {
+  cancelAnimationFrame(pinch.frame);
+  pinch.frame = 0;
+  zoomTo(Math.round(size * 2) / 2, y);
   localStorage.setItem('horadric.textzoom', zoom);
-  renderScreen();
-};
+}
+
+const screenwrap = $('screenwrap');
+screenwrap.addEventListener('touchstart', (ev) => {
+  if (ev.touches.length !== 2) return;
+  const f = fingers(ev);
+  pinch.from = f.gap || 1;
+  pinch.size = textSize();
+  pinch.at = pinch.size;
+  pinch.y = f.y;
+}, { passive: true });
+screenwrap.addEventListener('touchmove', (ev) => {
+  if (ev.touches.length !== 2 || !pinch.from) return;
+  ev.preventDefault();
+  const f = fingers(ev);
+  pinch.at = pinch.size * (f.gap / pinch.from);
+  pinch.y = f.y;
+  // Rewrapping the whole screen costs a layout, so once a frame at most.
+  pinch.frame ||= requestAnimationFrame(() => {
+    pinch.frame = 0;
+    zoomTo(pinch.at, pinch.y);
+  });
+}, { passive: false });
+screenwrap.addEventListener('touchend', (ev) => {
+  if (ev.touches.length >= 2 || !pinch.from) return;
+  pinch.from = 0;
+  saveZoom(pinch.at, pinch.y);
+});
+screenwrap.addEventListener('touchcancel', () => {
+  if (!pinch.from) return;
+  pinch.from = 0;
+  saveZoom(pinch.at, pinch.y);
+});
+// Safari's own pinch gesture would scale the whole page instead.
+document.addEventListener('gesturestart', (ev) => ev.preventDefault());
+// A trackpad pinch on a computer arrives as a wheel with Ctrl held.
+screenwrap.addEventListener('wheel', (ev) => {
+  if (!ev.ctrlKey) return;
+  ev.preventDefault();
+  const size = textSize() * Math.exp(-ev.deltaY / 100);
+  zoomTo(size, ev.clientY);
+  clearTimeout(pinch.idle);
+  pinch.idle = setTimeout(() => saveZoom(size, ev.clientY), 300);
+}, { passive: false });
 
 $('send').addEventListener('submit', (ev) => {
   ev.preventDefault();
   const text = $('text').value;
+  haptic('send');
   if (!text) return typeInto('\r');
   typeInto(text);
   // Enter apart from the text, so the agent sees typing then a key, not a
@@ -1086,6 +1607,103 @@ $('text').addEventListener('input', () => {
   const t = $('text');
   t.style.height = '';
   t.style.height = t.scrollHeight + 'px';
+});
+
+// Photos. The frame is 1 MB and base64 adds a third, so the page shrinks
+// the picture until it is well under that before sending it.
+
+const PHOTO_BYTES = 700 * 1024;
+
+async function bitmapOf(file) {
+  try {
+    return await createImageBitmap(file, { imageOrientation: 'from-image' });
+  } catch {
+    const url = URL.createObjectURL(file);
+    try {
+      const img = new Image();
+      img.src = url;
+      await img.decode();
+      return img;
+    } finally {
+      URL.revokeObjectURL(url);
+    }
+  }
+}
+
+// A JPEG under PHOTO_BYTES: the long side at most 2048 pixels, smaller
+// and rougher until it fits.
+async function shrink(file) {
+  const img = await bitmapOf(file);
+  const w0 = img.width, h0 = img.height;
+  let side = Math.min(2048, Math.max(w0, h0));
+  let quality = 0.85;
+  for (;;) {
+    const scale = side / Math.max(w0, h0);
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.max(1, Math.round(w0 * scale));
+    canvas.height = Math.max(1, Math.round(h0 * scale));
+    canvas.getContext('2d').drawImage(img, 0, 0, canvas.width, canvas.height);
+    const blob = await new Promise((done) => canvas.toBlob(done, 'image/jpeg', quality));
+    if (blob && (blob.size <= PHOTO_BYTES || side <= 320)) return blob;
+    if (quality > 0.6) quality -= 0.15;
+    else side = Math.round(side * 0.75);
+  }
+}
+
+function toB64url(blob) {
+  return new Promise((done, fail) => {
+    const r = new FileReader();
+    r.onload = () => done(r.result.slice(r.result.indexOf(',') + 1).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, ''));
+    r.onerror = () => fail(r.error);
+    r.readAsDataURL(blob);
+  });
+}
+
+function attachDone() {
+  clearTimeout(state.attaching && state.attaching.timer);
+  state.attaching = null;
+  $('attach').classList.remove('busy');
+  $('attach').disabled = false;
+}
+
+async function attachPhoto(file) {
+  const id = state.watching;
+  if (!id || state.attaching) return;
+  state.attaching = { id };
+  $('attach').classList.add('busy');
+  $('attach').disabled = true;
+  try {
+    const blob = await shrink(file);
+    const name = (file.name || 'photo').replace(/\.[^.]*$/, '') + '.jpg';
+    if (!(await send({ t: 'attach', id, name, data: await toB64url(blob) }))) throw new Error('offline');
+    // A PC before the attach message never answers.
+    state.attaching.timer = setTimeout(() => {
+      attachDone();
+      say('The PC did not take the photo. It may need a newer Horadric.');
+    }, 30000);
+  } catch {
+    attachDone();
+    say('Could not send that photo.');
+  }
+}
+
+// The PC saved it: its path goes into the message, for the agent to read.
+function attached(msg) {
+  if (!state.attaching || msg.id !== state.attaching.id) return;
+  attachDone();
+  if (typeof msg.path !== 'string' || msg.id !== state.watching) return;
+  const t = $('text');
+  const sep = t.value && !/\s$/.test(t.value) ? ' ' : '';
+  t.value += sep + msg.path + ' ';
+  t.dispatchEvent(new Event('input'));
+  t.focus();
+}
+
+$('attach').onclick = () => $('photo').click();
+$('photo').addEventListener('change', () => {
+  const file = $('photo').files[0];
+  $('photo').value = '';
+  if (file) attachPhoto(file);
 });
 
 $('back').onclick = () => history.back();
@@ -1171,11 +1789,34 @@ window.addEventListener('resize', () => state.watching && renderScreen());
 // fragment, so take it then too.
 function pairFromLink() {
   takeFragment();
+  // A notification's link on a page already up keeps its connection.
+  if (state.open && state.pc) return openFromPush();
   const pcs = loadPcs();
   const current = localStorage.getItem('horadric.current');
   choose(pcs.find((p) => p.id === current) || pcs[0] || null);
+  openFromPush();
+}
+
+// Shows the session a notification was about, on its PC when this phone
+// knows that PC. The watch goes out once connected, as after any hello.
+function openFromPush() {
+  const open = state.open;
+  state.open = null;
+  if (!open) return;
+  const pc = open.pc && loadPcs().find((p) => p.id === open.pc);
+  if (pc && (!state.pc || state.pc.id !== pc.id)) choose(pc);
+  if (state.pc) watch(open.id);
 }
 window.addEventListener('hashchange', pairFromLink);
 pairFromLink();
 
-if ('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js').catch(() => {});
+if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.register('/sw.js').catch(() => {});
+  // A notification clicked while the page is open.
+  navigator.serviceWorker.addEventListener('message', (ev) => {
+    const d = ev.data || {};
+    if (d.t !== 'open' || typeof d.id !== 'string') return;
+    state.open = { id: d.id, pc: typeof d.pc === 'string' ? d.pc : '' };
+    openFromPush();
+  });
+}
