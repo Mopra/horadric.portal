@@ -54,15 +54,45 @@ function pairWith(fragment) {
   return true;
 }
 
-// Take the link from the address bar, then wipe it from there. A
-// notification's link, #s=<session>&pc=<pc>, is kept in `state.open` for
-// the page to show that session.
+// Take the link from the address bar, then wipe it from there, so a
+// reload does not answer twice. A notification's link,
+// #s=<session>&pc=<pc>, is kept in `state.open` for the page to show that
+// session, and a button's answer on it (&a=<keys>&l=<label>&w=<since>) in
+// `state.answer` until the PC lists that session.
 function takeFragment() {
   if (location.hash.length < 2) return;
   const p = new URLSearchParams(location.hash.slice(1));
-  if (p.get('s')) state.open = { id: p.get('s'), pc: p.get('pc') || '' };
-  else pairWith(location.hash);
+  if (p.get('s')) {
+    state.open = { id: p.get('s'), pc: p.get('pc') || '' };
+    if (p.has('a')) holdAnswer(state.open, { keys: p.get('a'), label: p.get('l'), since: p.get('w') });
+  } else pairWith(location.hash);
   history.replaceState(null, '', location.pathname);
+}
+
+// An answer from a notification's button waits for the first session list
+// from its PC, and is dropped after a few minutes unsent.
+const ANSWER_FOR = 5 * 60 * 1000;
+function holdAnswer(open, a) {
+  if (!a || typeof a.keys !== 'string' || !a.keys) return;
+  const since = Number(a.since) || 0;
+  state.answer = { id: open.id, pc: open.pc, keys: a.keys, label: a.label || a.keys, since, at: Date.now() };
+}
+
+// Sends the held answer once, if the session still waits on the same
+// thing: the wait that began at `since` when the push said so, and one of
+// its options when the PC lists them. A wait that moved on keeps its keys.
+function sendHeldAnswer() {
+  const a = state.answer;
+  if (!a || !state.pc || (a.pc && a.pc !== state.pc.id)) return;
+  state.answer = null;
+  if (Date.now() - a.at > ANSWER_FOR) return;
+  const s = state.sessions.find((x) => x.id === a.id);
+  if (!s || phaseOf(s) !== 'waiting' || s.paused) return;
+  const at = askSince(s);
+  if (a.since && at && at !== (a.since < 1e12 ? a.since * 1000 : a.since)) return;
+  const options = s.ask && Array.isArray(s.ask.options) ? s.ask.options : null;
+  const opt = options ? options.find((o) => o && o.keys === a.keys) : { label: a.label, keys: a.keys };
+  if (opt) answer(s, { label: opt.label || a.label, keys: opt.keys });
 }
 
 // A link that carries this pairing somewhere this browser's storage does
@@ -127,6 +157,7 @@ async function open(key, buf) {
 const state = {
   pc: null,
   open: null, // the session a notification asked to show, {id, pc}
+  answer: null, // a notification button's answer, until its PC lists sessions, see holdAnswer
   key: null,
   ws: null,
   link: 'connecting', // connecting | offline (relay down) | pcoff | online
@@ -156,7 +187,7 @@ const state = {
   diffError: null,
   quests: null, // the PC's quests answer, null until it comes
   adding: null, // the project whose add-a-quest form is open
-  open: new Set(), // the quests whose notes show, by project and title
+  notesOpen: new Set(), // the quests whose notes show, by project and title
   added: null, // { project, at } while an added quest is on its way
   sheet: null, // the long press menu, see openSheet
   replyWait: null, // { id, resolve, reject, timer } while a reply is asked for
@@ -391,6 +422,7 @@ function onMessage(msg) {
       state.listed = true;
       state.sessions = Array.isArray(msg.list) ? msg.list : [];
       pruneSent();
+      sendHeldAnswer();
       renderList();
       if (state.view === 'quests') renderQuests();
       renderTitle();
@@ -933,7 +965,7 @@ function questRow(log, q) {
   const why = String(q.why || '');
   const line = !why ? word : q.state === 'after' ? why[0].toUpperCase() + why.slice(1) : `${word}: ${why}`;
   what.append(el('div', 'name', q.title), el('div', 'line', line));
-  if (state.open.has(id)) what.append(el('div', 'notes' + (notes.length ? '' : ' dim'), notes.length ? notes.join('\n') : 'No notes'));
+  if (state.notesOpen.has(id)) what.append(el('div', 'notes' + (notes.length ? '' : ' dim'), notes.length ? notes.join('\n') : 'No notes'));
   row.append(el('i', 'lamp ' + lamp), what);
   // The session on it, which the phone can open like any other.
   const holder = q.session && state.sessions.find((s) => s.id === q.session);
@@ -947,7 +979,7 @@ function questRow(log, q) {
     row.append(go);
   }
   row.onclick = () => {
-    if (!state.open.delete(id)) state.open.add(id);
+    if (!state.notesOpen.delete(id)) state.notesOpen.add(id);
     renderQuests();
   };
   return row;
@@ -2118,7 +2150,7 @@ window.addEventListener('resize', () => state.watching && renderScreen());
 function pairFromLink() {
   takeFragment();
   // A notification's link on a page already up keeps its connection.
-  if (state.open && state.pc) return openFromPush();
+  if (state.open && state.pc) return openNow();
   const pcs = loadPcs();
   const current = localStorage.getItem('horadric.current');
   choose(pcs.find((p) => p.id === current) || pcs[0] || null);
@@ -2135,6 +2167,14 @@ function openFromPush() {
   if (pc && (!state.pc || state.pc.id !== pc.id)) choose(pc);
   if (state.pc) watch(open.id);
 }
+
+// On a page already up: show the session, and answer at once when this
+// PC's sessions are listed already, since no new list need come first.
+function openNow() {
+  const same = state.listed && (!state.open.pc || state.open.pc === state.pc.id);
+  openFromPush();
+  if (same) sendHeldAnswer();
+}
 window.addEventListener('hashchange', pairFromLink);
 pairFromLink();
 
@@ -2145,6 +2185,8 @@ if ('serviceWorker' in navigator) {
     const d = ev.data || {};
     if (d.t !== 'open' || typeof d.id !== 'string') return;
     state.open = { id: d.id, pc: typeof d.pc === 'string' ? d.pc : '' };
-    openFromPush();
+    if (d.answer) holdAnswer(state.open, d.answer);
+    if (state.pc) openNow();
+    else openFromPush();
   });
 }
