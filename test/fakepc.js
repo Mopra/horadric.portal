@@ -1,8 +1,8 @@
 // A stand-in for Horadric's PC side, to try the relay and the page without
 // a PC: node test/fakepc.js [relay ws url]. It prints a pairing link,
 // answers hello, lists sessions, projects and folders, starts and makes
-// projects, and echoes what the phone types into
-// the watched session's screen.
+// projects, echoes what the phone types into the watched session's
+// screen, and streams output into the working one.
 'use strict';
 const crypto = require('crypto');
 const os = require('os');
@@ -210,6 +210,18 @@ function sendScreen(ch, sid) {
   if (!lines) return ws.send(R.frame(ch, seal({ t: 'error', text: 'No such session' })));
   ws.send(R.frame(ch, seal({ t: 'screen', id: sid, cols: 100, rows: 30, lines, cursor: [lines.length - 1, lines[lines.length - 1].length] })));
 }
+
+// The working session prints a line every half second, and its oldest
+// lines fall off past 80 the way a real PC's do past 500, to try how the
+// page keeps the view still while output streams in.
+let printed = 0;
+setInterval(() => {
+  const lines = screens.s2;
+  const prompt = lines.pop();
+  lines.push(`output ${++printed} at ${new Date().toLocaleTimeString()}`, prompt);
+  if (lines.length > 80) lines.splice(0, lines.length - 80);
+  for (const [ch, sid] of watching) if (sid === 's2') sendScreen(ch, sid);
+}, 500).unref();
 
 // Phases change now and then, as on a real PC.
 setInterval(() => {

@@ -150,9 +150,14 @@ code { font-family: ui-monospace, "Cascadia Mono", Menlo, monospace; color: var(
 .link { background: none; border: 0; color: var(--legend); text-decoration: underline; font-size: 13px; }
 
 #session { display: flex; flex-direction: column; overflow: hidden; }
+#screenbox { flex: 1; min-height: 0; position: relative; display: flex; flex-direction: column; }
 #screenwrap {
+  position: relative;
   flex: 1;
   min-height: 0;
+  /* The page keeps the view still itself, and the browser's own anchoring
+     where it has it would correct a second time. */
+  overflow-anchor: none;
   overflow-x: hidden;
   overflow-y: auto;
   background: var(--screen);
@@ -168,6 +173,14 @@ code { font-family: ui-monospace, "Cascadia Mono", Menlo, monospace; color: var(
   white-space: pre-wrap;
   overflow-wrap: anywhere;
   color: #d8d9de;
+}
+#screen > div { min-height: 1.3em; }
+#latest {
+  position: absolute;
+  right: 12px;
+  bottom: 12px;
+  margin: 0;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.6);
 }
 #keys {
   display: flex;
