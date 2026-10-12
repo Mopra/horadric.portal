@@ -143,6 +143,8 @@ const state = {
   tooOld: false,
   view: 'list', // unpaired | list | projects | session
   folders: null, // the PC's folders answer, null until it comes
+  sheet: null, // the long press menu, see openSheet
+  replyWait: null, // { id, resolve, reject, timer } while a reply is asked for
 };
 
 function setLink(link) {
@@ -355,6 +357,11 @@ function onMessage(msg) {
       state.sessions = Array.isArray(msg.list) ? msg.list : [];
       renderList();
       renderTitle();
+      // A rename being typed must not be reset by an update.
+      if (state.sheet && (state.sheet.mode !== 'rename' || !state.sessions.some((s) => s.id === state.sheet.id))) renderSheet();
+      break;
+    case 'reply':
+      gotReply(msg);
       break;
     case 'screen':
       if (msg.id === state.watching) {
@@ -502,6 +509,7 @@ function renderList() {
         b.append(r);
       }
       b.onclick = () => watch(s.id);
+      holdable(b, () => openSheet(s.id));
       sec.append(b);
     }
     if (!g.list.length && !startingHere) sec.append(el('div', 'dim none', 'No sessions'));
@@ -821,6 +829,263 @@ function renderScreen() {
   renderScreen.seen = true;
 }
 
+// Long press a session: rename, stop, copy its last reply
+
+const HOLD_MS = 500;
+const HOLD_SLOP = 10;
+
+// The click a browser may send when a held finger lifts lands on whatever
+// is under it by then, which is the sheet the hold opened. So after a hold
+// the next click anywhere is eaten, until shortly after the finger is up.
+const swallow = { holding: false, until: 0 };
+document.addEventListener(
+  'pointerup',
+  () => {
+    if (!swallow.holding) return;
+    swallow.holding = false;
+    swallow.until = Date.now() + 400;
+  },
+  true,
+);
+document.addEventListener(
+  'click',
+  (ev) => {
+    if (!swallow.holding && Date.now() > swallow.until) return;
+    swallow.holding = false;
+    swallow.until = 0;
+    ev.stopImmediatePropagation();
+    ev.preventDefault();
+  },
+  true,
+);
+
+// Calls `fn` when `target` is held still for HOLD_MS. A right click does
+// the same on a desktop, and Android's own long press arrives as
+// contextmenu too.
+function holdable(target, fn) {
+  let timer = null;
+  let from = null;
+  let held = false;
+  const cancel = () => {
+    clearTimeout(timer);
+    timer = null;
+  };
+  const fire = () => {
+    cancel();
+    held = true;
+    swallow.holding = true;
+    if (navigator.vibrate) navigator.vibrate(10);
+    fn();
+  };
+  target.addEventListener('pointerdown', (ev) => {
+    if (ev.button > 0) return;
+    held = false;
+    from = [ev.clientX, ev.clientY];
+    cancel();
+    timer = setTimeout(fire, HOLD_MS);
+  });
+  target.addEventListener('pointermove', (ev) => {
+    if (timer && Math.hypot(ev.clientX - from[0], ev.clientY - from[1]) > HOLD_SLOP) cancel();
+  });
+  for (const t of ['pointerup', 'pointercancel', 'pointerleave']) target.addEventListener(t, cancel);
+  target.addEventListener('contextmenu', (ev) => {
+    ev.preventDefault();
+    if (held) return;
+    fire();
+    // A right click has had its pointerup already, and sends no click.
+    if (ev.button === 2 && !ev.sourceCapabilities?.firesTouchEvents) swallow.holding = false;
+  });
+}
+
+// sheet: { id, mode: menu | rename | stop | reply, text, copied }
+function openSheet(id) {
+  if (!state.sessions.some((s) => s.id === id)) return;
+  if (state.sheet && state.sheet.id === id) return;
+  state.sheet = { id, mode: 'menu' };
+  renderSheet();
+}
+
+function closeSheet() {
+  state.sheet = null;
+  if (state.replyWait) {
+    clearTimeout(state.replyWait.timer);
+    state.replyWait.reject();
+    state.replyWait = null;
+  }
+  $('sheet').hidden = true;
+}
+
+function sheetButton(label, cls, onclick) {
+  const b = el('button', 'sheetbtn' + (cls ? ' ' + cls : ''), label);
+  b.type = 'button';
+  b.onclick = onclick;
+  return b;
+}
+
+function renderSheet() {
+  const sh = state.sheet;
+  if (!sh) return closeSheet();
+  const s = state.sessions.find((x) => x.id === sh.id);
+  if (!s) return closeSheet();
+  const name = s.name || s.id;
+  const online = state.link === 'online';
+  $('sheettitle').textContent = name;
+  const body = [];
+  if (sh.mode === 'menu') {
+    const actions = [
+      sheetButton('Rename', null, () => {
+        sh.mode = 'rename';
+        renderSheet();
+      }),
+      sheetButton('Copy last reply', null, copyReply),
+      sheetButton('Stop', 'danger', () => {
+        sh.mode = 'stop';
+        renderSheet();
+      }),
+    ];
+    for (const a of actions) a.disabled = !online;
+    body.push(...actions);
+  } else if (sh.mode === 'rename') {
+    const form = el('form', 'sheetform');
+    const input = el('input');
+    input.id = 'rename';
+    input.value = name;
+    input.maxLength = 80;
+    input.autocomplete = 'off';
+    input.setAttribute('enterkeyhint', 'done');
+    const save = sheetButton('Rename', 'gold');
+    save.type = 'submit';
+    form.append(input, el('p', 'dim', 'Leave it empty and Claude names it again.'), save);
+    form.onsubmit = (ev) => {
+      ev.preventDefault();
+      rename(s.id, input.value.trim());
+    };
+    body.push(form);
+    setTimeout(() => {
+      input.focus();
+      input.select();
+    }, 50);
+  } else if (sh.mode === 'stop') {
+    body.push(
+      el('p', 'sheettext', 'Stop this session? Its agent is ended on the PC and its tile goes, as closing its pane does.'),
+      sheetButton('Stop session', 'danger', () => stopSession(s.id)),
+    );
+  } else if (sh.mode === 'reply') {
+    if (sh.none) {
+      body.push(el('p', 'sheettext', sh.none));
+    } else if (sh.text == null) {
+      const row = el('div', 'sheetwait');
+      row.append(el('i', 'spinner'), el('span', null, 'Getting the last reply...'));
+      body.push(row);
+    } else {
+      body.push(el('pre', 'reply', sh.text));
+      body.push(
+        sheetButton(sh.copied ? 'Copied' : 'Copy', sh.copied ? 'done' : 'gold', async () => {
+          sh.copied = await copyText(sh.text);
+          renderSheet();
+        }),
+      );
+    }
+  }
+  body.push(sheetButton(sh.mode === 'reply' ? 'Close' : 'Cancel', 'quiet', closeSheet));
+  $('sheetbody').replaceChildren(...body);
+  $('sheet').hidden = false;
+}
+
+async function copyText(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// The reply comes over the network, after the tap's moment has passed,
+// and Safari copies only within a tap. A ClipboardItem may hold a promise
+// of its text, so the copy starts with the tap and finishes on the
+// answer. Where that fails, the reply shows with a Copy button.
+function copyReply() {
+  const sh = state.sheet;
+  sh.mode = 'reply';
+  sh.text = null;
+  sh.none = null;
+  sh.copied = false;
+  const id = sh.id;
+  const answer = new Promise((resolve, reject) => {
+    state.replyWait = {
+      id,
+      resolve,
+      reject,
+      timer: setTimeout(() => {
+        state.replyWait = null;
+        reject();
+        if (state.sheet && state.sheet.id === id) {
+          state.sheet.none = 'The PC did not answer. Copying a reply needs a newer Horadric on the PC.';
+          renderSheet();
+        }
+      }, 8000),
+    };
+  });
+  answer.catch(() => {});
+  if (window.ClipboardItem && navigator.clipboard && navigator.clipboard.write) {
+    const blob = answer.then((t) => (t == null ? Promise.reject() : new Blob([t], { type: 'text/plain' })));
+    navigator.clipboard
+      .write([new ClipboardItem({ 'text/plain': blob })])
+      .then(() => {
+        if (state.sheet && state.sheet.id === id) {
+          state.sheet.copied = true;
+          renderSheet();
+        }
+      })
+      .catch(() => {});
+  }
+  send({ t: 'reply', id });
+  renderSheet();
+}
+
+function gotReply(msg) {
+  const w = state.replyWait;
+  if (!w || w.id !== msg.id) return;
+  clearTimeout(w.timer);
+  state.replyWait = null;
+  const text = typeof msg.text === 'string' && msg.text ? msg.text : null;
+  w.resolve(text);
+  const sh = state.sheet;
+  if (!sh || sh.id !== msg.id) return;
+  if (text == null) sh.none = 'This session has no reply yet.';
+  sh.text = text;
+  renderSheet();
+}
+
+// An older PC ignores these, so the page says so if nothing comes of them.
+function rename(id, name) {
+  closeSheet();
+  send({ t: 'rename', id, name });
+  if (!name) return;
+  setTimeout(() => {
+    const s = state.sessions.find((x) => x.id === id);
+    if (s && s.name !== name) say('The PC did not rename it. Renaming from the phone needs a newer Horadric on the PC.');
+  }, 6000);
+}
+
+function stopSession(id) {
+  closeSheet();
+  send({ t: 'stop', id });
+  if (state.watching === id) history.back();
+  setTimeout(() => {
+    if (state.sessions.some((x) => x.id === id)) say('The PC did not stop it. Stopping from the phone needs a newer Horadric on the PC.');
+  }, 8000);
+}
+
+holdable($('title'), () => state.watching && openSheet(state.watching));
+$('sheet').addEventListener('click', (ev) => {
+  if (ev.target === $('sheet')) closeSheet();
+});
+document.addEventListener('keydown', (ev) => {
+  if (ev.key === 'Escape' && state.sheet) closeSheet();
+});
+
 // Navigation
 
 function show(view) {
@@ -858,6 +1123,7 @@ function unwatch() {
 }
 
 function choose(pc) {
+  closeSheet();
   state.pc = pc;
   state.sessions = [];
   state.projects = [];
