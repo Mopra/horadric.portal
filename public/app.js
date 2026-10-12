@@ -54,10 +54,14 @@ function pairWith(fragment) {
   return true;
 }
 
-// Take the link from the address bar, then wipe it from there.
+// Take the link from the address bar, then wipe it from there. A
+// notification's link, #s=<session>&pc=<pc>, is kept in `state.open` for
+// the page to show that session.
 function takeFragment() {
   if (location.hash.length < 2) return;
-  pairWith(location.hash);
+  const p = new URLSearchParams(location.hash.slice(1));
+  if (p.get('s')) state.open = { id: p.get('s'), pc: p.get('pc') || '' };
+  else pairWith(location.hash);
   history.replaceState(null, '', location.pathname);
 }
 
@@ -122,6 +126,7 @@ async function open(key, buf) {
 
 const state = {
   pc: null,
+  open: null, // the session a notification asked to show, {id, pc}
   key: null,
   ws: null,
   link: 'connecting', // connecting | offline (relay down) | pcoff | online
@@ -358,6 +363,7 @@ function onMessage(msg) {
       state.sessions = Array.isArray(msg.list) ? msg.list : [];
       renderList();
       renderTitle();
+      renderBadge();
       break;
     case 'screen':
       if (msg.id === state.watching) {
@@ -415,6 +421,14 @@ function renderTitle() {
   } else {
     $('title').textContent = state.pc ? state.pc.n : 'Horadric';
   }
+}
+
+// The app icon's count of sessions waiting, as the pushes set it while the
+// page is shut. Where the browser has no badge, nothing.
+function renderBadge() {
+  if (!navigator.setAppBadge) return;
+  const n = state.sessions.filter((s) => s.phase === 'waiting').length;
+  (n ? navigator.setAppBadge(n) : navigator.clearAppBadge()).catch(() => {});
 }
 
 function renderPcs() {
@@ -1333,11 +1347,34 @@ window.addEventListener('resize', () => state.watching && renderScreen());
 // fragment, so take it then too.
 function pairFromLink() {
   takeFragment();
+  // A notification's link on a page already up keeps its connection.
+  if (state.open && state.pc) return openFromPush();
   const pcs = loadPcs();
   const current = localStorage.getItem('horadric.current');
   choose(pcs.find((p) => p.id === current) || pcs[0] || null);
+  openFromPush();
+}
+
+// Shows the session a notification was about, on its PC when this phone
+// knows that PC. The watch goes out once connected, as after any hello.
+function openFromPush() {
+  const open = state.open;
+  state.open = null;
+  if (!open) return;
+  const pc = open.pc && loadPcs().find((p) => p.id === open.pc);
+  if (pc && (!state.pc || state.pc.id !== pc.id)) choose(pc);
+  if (state.pc) watch(open.id);
 }
 window.addEventListener('hashchange', pairFromLink);
 pairFromLink();
 
-if ('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js').catch(() => {});
+if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.register('/sw.js').catch(() => {});
+  // A notification clicked while the page is open.
+  navigator.serviceWorker.addEventListener('message', (ev) => {
+    const d = ev.data || {};
+    if (d.t !== 'open' || typeof d.id !== 'string') return;
+    state.open = { id: d.id, pc: typeof d.pc === 'string' ? d.pc : '' };
+    openFromPush();
+  });
+}
