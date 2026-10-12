@@ -1,8 +1,8 @@
 // A stand-in for Horadric's PC side, to try the relay and the page without
 // a PC: node test/fakepc.js [relay ws url]. It prints a pairing link,
 // answers hello, lists sessions, projects and folders, starts and makes
-// projects, echoes what the phone types into the watched session's
-// screen, and streams output into the working one.
+// projects, takes photos, echoes what the phone types into the watched
+// session's screen, and streams output into the working one.
 'use strict';
 const crypto = require('crypto');
 const os = require('os');
@@ -143,6 +143,11 @@ function start() {
       const path = `${root.path}\\${name}`;
       root.list.unshift({ path, name, git: true });
       startSession(path, reply);
+    } else if (msg.t === 'attach') {
+      const bytes = Buffer.from(msg.data || '', 'base64url');
+      console.log(`attach ${msg.name}: ${bytes.length} bytes for ${msg.id}`);
+      const path = ['C:', 'Users', 'me', 'AppData', 'Roaming', 'Horadric', 'portal-attach', msg.id, `${Math.floor(Date.now() / 1000)}-${msg.name}`].join('\\');
+      setTimeout(() => reply({ t: 'attached', id: msg.id, name: msg.name, path }), 300);
     } else if (msg.t === 'resume') {
       const s = sessions.find((x) => x.id === msg.id);
       if (!s) return reply({ t: 'error', text: 'No such session' });

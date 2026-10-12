@@ -163,6 +163,8 @@ code { font-family: ui-monospace, "Cascadia Mono", Menlo, monospace; color: var(
   background: var(--screen);
   box-shadow: inset 0 2px 6px #000;
   -webkit-overflow-scrolling: touch;
+  /* Two fingers size the text (app.js), not the page. */
+  touch-action: pan-y;
 }
 #screen {
   margin: 0;
@@ -174,7 +176,7 @@ code { font-family: ui-monospace, "Cascadia Mono", Menlo, monospace; color: var(
   overflow-wrap: anywhere;
   color: #d8d9de;
 }
-#screen > div { min-height: 1.3em; }
+#screen > div { min-height: 1.3em; min-height: 1lh; }
 #latest {
   position: absolute;
   right: 12px;
@@ -204,7 +206,6 @@ code { font-family: ui-monospace, "Cascadia Mono", Menlo, monospace; color: var(
   font-size: 14px;
 }
 #keys button:active { background: #1a1b1f; box-shadow: inset 0 1px 3px #000; }
-#keys .zoom { color: var(--dim); }
 #send {
   display: flex;
   gap: 8px;
@@ -225,7 +226,20 @@ code { font-family: ui-monospace, "Cascadia Mono", Menlo, monospace; color: var(
   font: 16px/1.3 -apple-system, "Segoe UI", sans-serif;
   box-shadow: inset 0 2px 4px #000;
 }
-#send button {
+#send .clip {
+  padding: 0 10px;
+  border-radius: 10px;
+  border: 1px solid #000;
+  background: linear-gradient(#2a2c32, #202227);
+  color: var(--text);
+  font-weight: normal;
+  display: flex;
+  align-items: center;
+}
+#send .clip.busy { color: var(--gold); animation: pulse 1s ease-in-out infinite alternate; }
+@keyframes pulse { to { opacity: 0.4; } }
+@media (prefers-reduced-motion: reduce) { #send .clip.busy { animation: none; } }
+#send button:not(.clip) {
   padding: 0 16px;
   border-radius: 10px;
   border: 1px solid #000;
@@ -322,3 +336,37 @@ code { font-family: ui-monospace, "Cascadia Mono", Menlo, monospace; color: var(
 .root .rpath { margin: -2px 0 6px 4px; font-size: 11px; color: var(--legend); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .folder { padding: 10px 12px; }
 .folder .git { flex: none; font-size: 11px; color: var(--done); border: 1px solid rgba(61, 214, 140, 0.4); border-radius: 4px; padding: 1px 5px; }
+
+/* Feel: views that slide, and a skeleton while connecting */
+.view.entering, .view.leaving { animation-duration: 0.24s; animation-timing-function: cubic-bezier(0.2, 0.7, 0.2, 1); animation-fill-mode: both; }
+.view.entering, .view.leaving { background: var(--bg); }
+.view.leaving { position: fixed; left: 0; right: 0; pointer-events: none; z-index: 0; }
+.view.entering { position: relative; z-index: 1; }
+/* Back: the page that leaves slides off over the one beneath it. */
+.view.leaving.back { z-index: 2; }
+.view.entering.fwd { animation-name: in-fwd; }
+.view.entering.back { animation-name: in-back; }
+.view.leaving.fwd { animation-name: out-fwd; }
+.view.leaving.back { animation-name: out-back; }
+@keyframes in-fwd { from { transform: translateX(100%); } }
+@keyframes in-back { from { transform: translateX(-30%); opacity: 0.4; } }
+@keyframes out-fwd { to { transform: translateX(-30%); opacity: 0.4; } }
+@keyframes out-back { to { transform: translateX(100%); } }
+#bar { position: relative; z-index: 3; }
+html { overflow: hidden; }
+.skeleton .sess { cursor: default; }
+.bone {
+  height: 12px;
+  border-radius: 6px;
+  background: linear-gradient(90deg, #24262c 0%, #2e3038 50%, #24262c 100%) 0 0 / 200% 100%;
+  animation: shimmer 1.4s linear infinite;
+}
+.bone.head { width: 30%; height: 10px; margin: 4px 0 10px 4px; }
+.bone.name { width: 55%; margin-bottom: 7px; }
+.bone.line { width: 80%; height: 10px; opacity: 0.6; }
+.skeleton .sess:nth-of-type(3) .bone.name { width: 40%; }
+@keyframes shimmer { to { background-position: -200% 0; } }
+@media (prefers-reduced-motion: reduce) {
+  .view.entering, .view.leaving { animation: none; }
+  .bone { animation: none; }
+}
