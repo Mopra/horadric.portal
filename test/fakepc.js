@@ -1,8 +1,9 @@
 // A stand-in for Horadric's PC side, to try the relay and the page without
 // a PC: node test/fakepc.js [relay ws url]. It prints a pairing link,
 // answers hello, lists sessions, projects and folders, starts and makes
-// projects, takes photos, and echoes what the phone types into
-// the watched session's screen.
+// projects, takes photos, renames and stops sessions, answers their last
+// reply, echoes what the phone types into the watched session's screen,
+// and streams output into the working one.
 'use strict';
 const crypto = require('crypto');
 const os = require('os');
@@ -86,7 +87,7 @@ function startSession(path, reply) {
 }
 
 const sessions = [
-  { id: 's1', name: 'relay', project: 'horadric.portal', phase: 'waiting', line: 'Bash: npm test' },
+  { id: 's1', name: 'relay', project: 'horadric.portal', phase: 'waiting', line: 'Bash: npm test', ask: { kind: 'permission', tool: 'Bash', options: [{ label: 'Yes', keys: '1' }, { label: 'No', keys: '2' }] } },
   { id: 's2', name: 'ui', project: 'horadric.dev', phase: 'working', line: 'Editing app.rs' },
   { id: 's4', name: 'pick', project: 'horadric.dev', phase: 'waiting', line: 'Question' },
   { id: 's3', name: 'docs', project: 'horadric.dev', phase: 'idle', line: '', paused: true },
@@ -163,6 +164,20 @@ function start() {
         broadcast({ t: 'sessions', list: sessions });
         for (const [ch, sid] of watching) if (sid === s.id) sendScreen(ch, sid);
       }, 1000);
+    } else if (msg.t === 'rename') {
+      const s = sessions.find((x) => x.id === msg.id);
+      if (!s) return reply({ t: 'error', text: 'That session is gone.' });
+      s.name = String(msg.name || '').trim() || `claude ${s.id}`;
+      broadcast({ t: 'sessions', list: sessions });
+    } else if (msg.t === 'stop') {
+      const at = sessions.findIndex((x) => x.id === msg.id);
+      if (at < 0) return reply({ t: 'error', text: 'That session is gone.' });
+      sessions.splice(at, 1);
+      broadcast({ t: 'sessions', list: sessions });
+    } else if (msg.t === 'reply') {
+      const s = sessions.find((x) => x.id === msg.id);
+      const text = s && s.id !== 's3' ? `Done with ${s.name}.\n\nAll 42 tests pass. Want me to ship it?` : null;
+      setTimeout(() => reply({ t: 'reply', id: msg.id, text }), 400);
     } else if (msg.t === 'push') {
       subs.set(msg.sub.endpoint, msg.sub);
       console.log('push subscription', msg.sub.endpoint.slice(0, 60));
@@ -230,6 +245,18 @@ function sendScreen(ch, sid) {
   if (!lines) return ws.send(R.frame(ch, seal({ t: 'error', text: 'No such session' })));
   ws.send(R.frame(ch, seal({ t: 'screen', id: sid, cols: 100, rows: 30, lines, cursor: [lines.length - 1, lines[lines.length - 1].length] })));
 }
+
+// The working session prints a line every half second, and its oldest
+// lines fall off past 80 the way a real PC's do past 500, to try how the
+// page keeps the view still while output streams in.
+let printed = 0;
+setInterval(() => {
+  const lines = screens.s2;
+  const prompt = lines.pop();
+  lines.push(`output ${++printed} at ${new Date().toLocaleTimeString()}`, prompt);
+  if (lines.length > 80) lines.splice(0, lines.length - 80);
+  for (const [ch, sid] of watching) if (sid === 's2') sendScreen(ch, sid);
+}, 500).unref();
 
 // Phases change now and then, as on a real PC.
 setInterval(() => {

@@ -70,7 +70,10 @@
 </main>
 
 <main id="session" class="view" hidden>
-  <div id="screenwrap"><pre id="screen"></pre></div>
+  <div id="screenbox">
+    <div id="screenwrap"><pre id="screen"></pre></div>
+    <button id="latest" class="pill" hidden>Latest &#8595;</button>
+  </div>
   <div id="resumebar" hidden><span>Paused on the PC.</span><button id="resume" class="pill">Resume</button></div>
   <div id="keys">
     <button data-k="&#13;">Enter</button>
@@ -80,11 +83,11 @@
     <button data-k="&#9;">Tab</button>
     <button data-k="&#27;[Z">&#8679;Tab</button>
     <button data-k="&#3;">Ctrl+C</button>
-    <button data-k="1">1</button>
-    <button data-k="2">2</button>
-    <button data-k="3">3</button>
-    <button data-k="y">y</button>
-    <button data-k="n">n</button>
+    <button data-k="1" data-answer>1</button>
+    <button data-k="2" data-answer>2</button>
+    <button data-k="3" data-answer>3</button>
+    <button data-k="y" data-answer>y</button>
+    <button data-k="n" data-answer>n</button>
   </div>
   <form id="send">
     <button type="button" id="attach" class="clip" aria-label="Attach a photo"><svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path d="M4 8h3l2-3h6l2 3h3v11H4z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><circle cx="12" cy="13" r="3.5" fill="none" stroke="currentColor" stroke-width="1.8"/></svg></button>
@@ -93,6 +96,13 @@
     <button type="submit">Send</button>
   </form>
 </main>
+
+<div id="sheet" class="sheet" hidden>
+  <div class="sheetbox" role="dialog" aria-modal="true" aria-labelledby="sheettitle">
+    <div id="sheettitle" class="sheettitle"></div>
+    <div id="sheetbody"></div>
+  </div>
+</div>
 
 <script src="/app.js"></script>
 </body>
