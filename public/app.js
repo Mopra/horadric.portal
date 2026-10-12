@@ -143,6 +143,12 @@ const state = {
   tooOld: false,
   view: 'list', // unpaired | list | projects | session
   folders: null, // the PC's folders answer, null until it comes
+  changes: null, // the watched session's changed files, null until the PC answers
+  changesOpen: false, // whether the list of them is open
+  watchedPhase: null, // the watched session's phase, to ask again when it moves
+  diffPath: null, // the file whose diff is shown
+  diff: null, // the PC's diff answer for it
+  diffError: null,
 };
 
 function setLink(link) {
@@ -323,6 +329,8 @@ function onMessage(msg) {
       state.s = typeof msg.s === 'string' ? msg.s : null;
       state.n = 0;
       if (state.watching) send({ t: 'watch', id: state.watching });
+      askChanges();
+      if (state.diffPath) send({ t: 'diff', id: state.watching, path: state.diffPath });
       state.tooOld = !SPEAKS.includes(msg.v);
       state.pcName = msg.pc || state.pc.n;
       if (msg.pc && msg.pc !== state.pc.n) {
@@ -355,6 +363,26 @@ function onMessage(msg) {
       state.sessions = Array.isArray(msg.list) ? msg.list : [];
       renderList();
       renderTitle();
+      // A turn that ends or starts waiting has likely changed files.
+      if (state.watching) {
+        const s = state.sessions.find((x) => x.id === state.watching);
+        const phase = s ? s.phase : null;
+        if (phase !== state.watchedPhase) askChanges();
+        state.watchedPhase = phase;
+      }
+      break;
+    case 'changes':
+      if (msg.id === state.watching) {
+        state.changes = Array.isArray(msg.files) ? msg.files.filter((f) => f && typeof f.path === 'string') : [];
+        renderChanges();
+        if (state.view === 'diff') renderDiff();
+      }
+      break;
+    case 'diff':
+      if (msg.id === state.watching && msg.path === state.diffPath) {
+        state.diff = msg;
+        renderDiff();
+      }
       break;
     case 'screen':
       if (msg.id === state.watching) {
@@ -371,6 +399,11 @@ function onMessage(msg) {
       if (state.watching && /paused/i.test(msg.text || '')) {
         state.paused = true;
         renderScreen();
+        break;
+      }
+      if (state.view === 'diff' && !state.diff) {
+        state.diffError = msg.text || 'The PC could not show this file.';
+        renderDiff();
         break;
       }
       if (state.starting) {
@@ -400,7 +433,9 @@ function renderNote() {
 }
 
 function renderTitle() {
-  if (state.watching) {
+  if (state.view === 'diff') {
+    $('title').textContent = baseName(state.diffPath || '') || 'Changes';
+  } else if (state.watching) {
     const s = state.sessions.find((x) => x.id === state.watching);
     $('title').textContent = s ? s.name : 'Session';
   } else if (state.view === 'projects') {
@@ -821,12 +856,125 @@ function renderScreen() {
   renderScreen.seen = true;
 }
 
+// What changed
+
+// The watched session's changed files, from the PC's changes answer. A
+// PC before 0.24 never answers, and the strip stays hidden.
+function askChanges() {
+  if (state.watching) send({ t: 'changes', id: state.watching });
+}
+
+function countsEl(f) {
+  const span = el('span', 'counts');
+  if (f.added == null) {
+    span.append(el('span', 'dim', 'binary'));
+    return span;
+  }
+  span.append(el('span', 'n-add', `+${f.added}`), ' ', el('span', 'n-del', `−${f.removed}`));
+  return span;
+}
+
+function renderChanges() {
+  const files = state.changes || [];
+  $('changes').hidden = !files.length;
+  if (!files.length) return;
+  const sum = files.reduce((t, f) => ({ added: t.added + (f.added || 0), removed: t.removed + (f.removed || 0) }), { added: 0, removed: 0 });
+  $('changecount').textContent = files.length === 1 ? '1 file changed' : `${files.length} files changed`;
+  $('changelines').replaceChildren(...countsEl(sum).childNodes);
+  $('changesum').setAttribute('aria-expanded', String(state.changesOpen));
+  $('changes').classList.toggle('open', state.changesOpen);
+  $('changelist').hidden = !state.changesOpen;
+  $('changelist').replaceChildren(
+    ...files.map((f) => {
+      const b = el('button', 'file');
+      const cut = f.path.lastIndexOf('/');
+      const name = el('span', 'fname');
+      if (cut >= 0) name.append(el('span', 'dir', f.path.slice(0, cut + 1)));
+      name.append(el('b', null, f.path.slice(cut + 1)));
+      b.append(name, countsEl(f));
+      b.onclick = () => openDiff(f.path);
+      return b;
+    }),
+  );
+}
+
+function openDiff(path) {
+  if (!state.watching) return;
+  state.diffPath = path;
+  state.diff = null;
+  state.diffError = null;
+  show('diff');
+  renderTitle();
+  renderDiff();
+  $('diff').scrollTop = 0;
+  history.pushState({ session: state.watching, diff: path }, '');
+  send({ t: 'diff', id: state.watching, path });
+}
+
+function closeDiff() {
+  state.diffPath = null;
+  state.diff = null;
+  state.diffError = null;
+  show('session');
+  renderTitle();
+  renderScreen();
+  askChanges();
+}
+
+// The kind of a line of git's diff, for its colour. The file's own
+// header is left out: the title already names the file.
+function diffKind(line) {
+  if (/^(diff --git|index |--- |\+\+\+ |new file mode|deleted file mode|old mode|new mode|similarity|rename )/.test(line)) return null;
+  if (line.startsWith('@@')) return 'hunk';
+  if (line.startsWith('+')) return 'add';
+  if (line.startsWith('-')) return 'del';
+  if (line.startsWith('\\')) return 'meta';
+  if (line.startsWith(' ')) return 'ctx';
+  // Anything else is git talking, such as "Binary files differ".
+  return null;
+}
+
+function renderDiff() {
+  const path = state.diffPath || '';
+  const f = (state.changes || []).find((x) => x.path === path);
+  $('diffpath').replaceChildren(el('span', 'dir', path), ...(f ? [countsEl(f)] : []));
+  const body = $('diffbody');
+  body.style.fontSize = Math.max(9, Math.min(22, 13 + zoom)) + 'px';
+  const d = state.diff;
+  if (!d) {
+    body.replaceChildren(el('p', 'dim center', state.diffError || 'Asking the PC...'));
+    return;
+  }
+  const rows = [];
+  for (const line of String(d.text || '').split('\n')) {
+    const kind = diffKind(line);
+    if (!kind) continue;
+    if (kind === 'hunk') {
+      // `@@ -12,7 +12,9 @@ fn name`: the new side's first line, then
+      // the function git found it in.
+      const m = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@ ?(.*)$/.exec(line);
+      rows.push(el('div', 'dl hunk', m ? `Line ${m[1]}${m[2] ? '  ' + m[2] : ''}` : line));
+      continue;
+    }
+    rows.push(el('div', 'dl ' + kind, kind === 'meta' ? line.slice(2) : line.slice(1) || ' '));
+  }
+  if (!rows.length) rows.push(el('p', 'dim center', /^Binary files/m.test(d.text || '') ? 'A binary file. Nothing to show as text.' : 'No changes in the text.'));
+  if (d.cut) rows.push(el('p', 'dim center', 'Cut at 200 KB. The rest is on the PC.'));
+  body.replaceChildren(...rows);
+}
+
+$('changesum').onclick = () => {
+  state.changesOpen = !state.changesOpen;
+  renderChanges();
+  if (state.changesOpen) askChanges();
+};
+
 // Navigation
 
 function show(view) {
   state.view = view;
-  for (const v of ['unpaired', 'list', 'projects', 'session']) $(v).hidden = v !== view;
-  $('back').hidden = view !== 'session' && view !== 'projects';
+  for (const v of ['unpaired', 'list', 'projects', 'session', 'diff']) $(v).hidden = v !== view;
+  $('back').hidden = view !== 'session' && view !== 'projects' && view !== 'diff';
 }
 
 function watch(id) {
@@ -837,11 +985,19 @@ function watch(id) {
   state.watching = id;
   state.screen = null;
   state.paused = false;
+  if (!again) {
+    state.changes = null;
+    state.changesOpen = false;
+    const s = state.sessions.find((x) => x.id === id);
+    state.watchedPhase = s ? s.phase : null;
+  }
   renderScreen.seen = false;
   show('session');
   renderTitle();
   renderScreen();
   send({ t: 'watch', id });
+  renderChanges();
+  askChanges();
   // One history entry for the session view, whichever session it shows.
   if (swap) history.replaceState({ session: id }, '');
   else if (!again) history.pushState({ session: id }, '');
@@ -852,6 +1008,9 @@ function unwatch() {
   state.watching = null;
   state.paused = false;
   state.screen = null;
+  state.changes = null;
+  state.diffPath = null;
+  state.diff = null;
   send({ t: 'unwatch' });
   show('list');
   renderTitle();
@@ -867,6 +1026,9 @@ function choose(pc) {
   state.watching = null;
   state.tooOld = false;
   state.folders = null;
+  state.changes = null;
+  state.diffPath = null;
+  state.diff = null;
   if (pc) localStorage.setItem('horadric.current', pc.id);
   renderPcs();
   renderTitle();
@@ -928,6 +1090,7 @@ $('text').addEventListener('input', () => {
 
 $('back').onclick = () => history.back();
 window.addEventListener('popstate', () => {
+  if (state.view === 'diff') return closeDiff();
   if (state.watching) return unwatch();
   if (state.view === 'projects') {
     show('list');

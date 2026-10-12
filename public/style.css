@@ -309,3 +309,90 @@ code { font-family: ui-monospace, "Cascadia Mono", Menlo, monospace; color: var(
 .root .rpath { margin: -2px 0 6px 4px; font-size: 11px; color: var(--legend); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .folder { padding: 10px 12px; }
 .folder .git { flex: none; font-size: 11px; color: var(--done); border: 1px solid rgba(61, 214, 140, 0.4); border-radius: 4px; padding: 1px 5px; }
+
+/* 0.24: what a session changed */
+#changes { flex: none; background: var(--plate); border-bottom: 1px solid #000; }
+#changesum {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 8px 12px;
+  background: none;
+  border: 0;
+  font-size: 13px;
+  color: var(--dim);
+  text-align: left;
+}
+#changecount { flex: 1; }
+.chev {
+  width: 7px;
+  height: 7px;
+  border-right: 1.5px solid var(--legend);
+  border-bottom: 1.5px solid var(--legend);
+  transform: rotate(45deg) translateY(-2px);
+  transition: transform 0.15s;
+}
+#changes.open .chev { transform: rotate(-135deg) translateY(-2px); }
+#changelist { max-height: 40vh; overflow-y: auto; border-top: 1px solid var(--line); }
+#changelist .file {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  width: 100%;
+  padding: 9px 12px;
+  background: none;
+  border: 0;
+  border-bottom: 1px solid var(--line);
+  text-align: left;
+  font-size: 14px;
+}
+#changelist .file:active { background: var(--surface); }
+.fname { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.fname b { font-weight: 600; color: var(--text); }
+.dir { color: var(--legend); }
+.counts { flex: none; font: 12px ui-monospace, "Cascadia Mono", Menlo, monospace; white-space: nowrap; }
+.n-add { color: var(--done); }
+.n-del { color: var(--error); }
+
+#diff { background: var(--screen); }
+.diffpath {
+  position: sticky;
+  top: 0;
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  padding: 8px 12px;
+  background: var(--plate);
+  border-bottom: 1px solid #000;
+  font-size: 13px;
+}
+.diffpath .dir { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+#diffbody {
+  padding: 4px 0 calc(env(safe-area-inset-bottom) + 16px);
+  font-family: ui-monospace, "Cascadia Mono", "SF Mono", Menlo, Consolas, monospace;
+  font-size: 13px;
+  line-height: 1.35;
+  color: #c9cad0;
+}
+.dl {
+  padding: 0 10px 0 12px;
+  border-left: 3px solid transparent;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  tab-size: 4;
+}
+.dl.add { background: rgba(61, 214, 140, 0.11); border-left-color: var(--done); color: #b9f0d2; }
+.dl.del { background: rgba(255, 93, 102, 0.11); border-left-color: var(--error); color: #ffc4c8; }
+.dl.meta { color: var(--legend); font-style: italic; }
+.dl.hunk {
+  margin: 10px 0 2px;
+  padding: 3px 12px;
+  background: var(--plate);
+  color: var(--working);
+  font-size: 0.85em;
+  border-top: 1px solid var(--line);
+  border-bottom: 1px solid var(--line);
+}
+.dl.hunk:first-child { margin-top: 0; }
+#diffbody .center { font-family: -apple-system, "Segoe UI", sans-serif; }

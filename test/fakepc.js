@@ -96,6 +96,43 @@ for (const s of sessions) {
 }
 const watching = new Map();
 
+// What each session changed, as 0.24's changes and diff answers have it.
+const changed = {
+  s1: [
+    { path: 'server.js', added: 14, removed: 3 },
+    { path: 'test/relay.test.js', added: 40, removed: 0 },
+    { path: 'public/icon.png', added: null, removed: null },
+  ],
+  s2: [
+    { path: 'crates/horadric-ui/src/portaling.rs', added: 2, removed: 1 },
+    { path: 'Cargo.lock', added: 3000, removed: 0 },
+  ],
+};
+const diffs = {
+  'server.js': [
+    'diff --git a/server.js b/server.js',
+    'index 1111111..2222222 100644',
+    '--- a/server.js',
+    '+++ b/server.js',
+    '@@ -10,7 +10,9 @@ const http = require(\'http\');',
+    ' const PORT = Number(process.env.PORT) || 43200;',
+    '-const MAX = 1 << 20;',
+    '+// A frame is at most 1 MB, so a phone cannot make the relay hold more than that for it, whatever it sends.',
+    '+const MAX = 1 << 20;',
+    '+const PHONES = 8;',
+    ' ',
+    '\tfunction pcId(secret) {',
+    '@@ -80,4 +82,4 @@ function route(req) {',
+    '-  return null;',
+    '+  return undefined;',
+    '\\ No newline at end of file',
+    '',
+  ].join('\n'),
+  'public/icon.png': 'diff --git a/public/icon.png b/public/icon.png\nBinary files a/public/icon.png and b/public/icon.png differ\n',
+  'crates/horadric-ui/src/portaling.rs': '@@ -1,3 +1,4 @@\n use std::path::Path;\n-use x;\n+use y;\n+use z;\n',
+  'Cargo.lock': '@@ -0,0 +1,3000 @@\n' + Array.from({ length: 3000 }, (_, i) => `+line ${i}`).join('\n') + '\n',
+};
+
 let ws;
 function start() {
   ws = new WebSocket(`${relay}/pc?secret=${encodeURIComponent(secret)}`);
@@ -151,6 +188,12 @@ function start() {
         broadcast({ t: 'sessions', list: sessions });
         for (const [ch, sid] of watching) if (sid === s.id) sendScreen(ch, sid);
       }, 1000);
+    } else if (msg.t === 'changes') {
+      reply({ t: 'changes', id: msg.id, files: changed[msg.id] || [] });
+    } else if (msg.t === 'diff') {
+      const files = changed[msg.id] || [];
+      if (!files.some((f) => f.path === msg.path)) return reply({ t: 'error', text: 'That file has no changes now.' });
+      reply({ t: 'diff', id: msg.id, path: msg.path, text: diffs[msg.path] || '', cut: msg.path === 'Cargo.lock' });
     } else if (msg.t === 'push') {
       subs.set(msg.sub.endpoint, msg.sub);
       console.log('push subscription', msg.sub.endpoint.slice(0, 60));
