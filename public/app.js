@@ -872,26 +872,107 @@ function cellWidth(pre) {
   return ctx.measureText('M'.repeat(20)).width / 20 || 8;
 }
 
+// How far from the bottom still counts as following the output.
+const NEAR = 40;
+const atBottom = (wrap) => wrap.scrollHeight - wrap.scrollTop - wrap.clientHeight < NEAR;
+
+// How many lines fell off the top between two frames. Once the PC's 500
+// lines of scrollback are full, new output pushes old lines out, and
+// matching the new first lines against the old ones finds by how many,
+// so the rest keep their nodes instead of every line being redrawn.
+function dropped(old, lines) {
+  if (!old.length || !lines.length || old[0] === lines[0]) return 0;
+  const run = Math.min(8, lines.length);
+  for (let k = 1; k < old.length; k++) {
+    let m = 0;
+    while (m < run && k + m < old.length && old[k + m] === lines[m]) m++;
+    if (m === run || (m > 0 && k + m === old.length)) return k;
+  }
+  return 0;
+}
+
+// The screen is one div per line, and a frame changes only the lines
+// whose HTML differs, so a selection and the scroll position survive the
+// four updates a second. The HTML of each shown line is kept here.
+let shown = [];
+
 function renderScreen() {
   const sc = state.screen;
   const pre = $('screen');
   const wrap = $('screenwrap');
-  const atBottom = wrap.scrollHeight - wrap.scrollTop - wrap.clientHeight < 40;
+  const follow = atBottom(wrap) || !renderScreen.seen;
   pre.style.fontSize = textSize() + 'px';
+  // Whole pixel lines, since the browser rounds scrollTop and keeping the
+  // view still adds up line heights a frame at a time.
+  pre.style.lineHeight = Math.round(textSize() * 1.3) + 'px';
   const cols = Math.max(20, Math.floor((pre.clientWidth - 12) / cellWidth(pre)));
   if (sc) {
     // A PC before colours sends no styles, and its lines draw plain.
     const styles = sc.styles || [];
-    pre.innerHTML = (sc.lines || [])
-      .map((l, i) => lineHtml(fitLine(cells(l, styles[i]), cols), styles[i]))
-      .join('\n');
+    const html = (sc.lines || []).map((l, i) => lineHtml(fitLine(cells(l, styles[i]), cols), styles[i]));
+    if (!shown.length) pre.textContent = '';
+    // Where the reader is looking, to put it back after the change.
+    const anchor = follow ? null : firstVisible(pre, wrap);
+    const offset = anchor ? anchor.getBoundingClientRect().top : 0;
+    let lost = 0;
+    const k = dropped(shown, html);
+    for (let i = 0; i < k; i++) {
+      lost += pre.firstChild.offsetHeight;
+      pre.firstChild.remove();
+    }
+    shown = shown.slice(k);
+    const rows = pre.children;
+    html.forEach((h, i) => {
+      if (i < shown.length) {
+        if (shown[i] !== h) rows[i].innerHTML = h;
+      } else {
+        const div = document.createElement('div');
+        div.innerHTML = h;
+        pre.appendChild(div);
+      }
+    });
+    while (rows.length > html.length) pre.lastChild.remove();
+    shown = html;
+    // Measured to the subpixel, since rounded offsets drift a pixel a frame.
+    if (anchor && anchor.isConnected) wrap.scrollTop += anchor.getBoundingClientRect().top - offset;
+    else if (!follow) wrap.scrollTop -= lost;
   } else {
+    shown = [];
     pre.textContent = state.paused ? 'This session is paused.' : 'Waiting for the screen...';
   }
   $('resumebar').hidden = !state.paused;
-  if (atBottom || !renderScreen.seen) wrap.scrollTop = wrap.scrollHeight;
+  if (follow) wrap.scrollTop = wrap.scrollHeight;
   renderScreen.seen = true;
+  renderLatest();
 }
+
+// The first line at least partly in view, found by halving since a long
+// session has hundreds.
+function firstVisible(pre, wrap) {
+  const rows = pre.children;
+  const top = wrap.scrollTop;
+  let lo = 0;
+  let hi = rows.length - 1;
+  if (hi < 0) return null;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    const r = rows[mid];
+    if (r.offsetTop + r.offsetHeight <= top) lo = mid + 1;
+    else hi = mid;
+  }
+  return rows[lo];
+}
+
+function renderLatest() {
+  $('latest').hidden = !state.screen || atBottom($('screenwrap'));
+}
+
+$('screenwrap').addEventListener('scroll', renderLatest, { passive: true });
+$('latest').onclick = () => {
+  const wrap = $('screenwrap');
+  wrap.scrollTop = wrap.scrollHeight;
+  renderLatest();
+};
 
 // Long press a session: rename, stop, copy its last reply
 
