@@ -143,6 +143,7 @@ const state = {
   tooOld: false,
   view: 'list', // unpaired | list | projects | session
   folders: null, // the PC's folders answer, null until it comes
+  listed: false, // a sessions answer came from this PC, so the list is real
 };
 
 function setLink(link) {
@@ -153,6 +154,7 @@ function setLink(link) {
   lamp.className = 'lamp ' + (link === 'online' ? 'online' : link === 'connecting' ? 'connecting' : 'offline');
   label.textContent = words[link];
   renderNote();
+  renderList();
 }
 
 // Connection
@@ -352,6 +354,7 @@ function onMessage(msg) {
       renderFolders();
       break;
     case 'sessions':
+      state.listed = true;
       state.sessions = Array.isArray(msg.list) ? msg.list : [];
       renderList();
       renderTitle();
@@ -469,7 +472,32 @@ function el(tag, cls, text) {
   return e;
 }
 
+// Grey rows in the shape of the list, while the first answer is on its way,
+// so connecting looks like loading and not like a PC with nothing on it.
+function skeleton() {
+  const out = [];
+  for (const rows of [2, 1]) {
+    const sec = el('section', 'group skeleton');
+    sec.setAttribute('aria-hidden', 'true');
+    sec.append(el('div', 'bone head'));
+    for (let i = 0; i < rows; i++) {
+      const row = el('div', 'sess');
+      const what = el('div', 'what');
+      what.append(el('div', 'bone name'), el('div', 'bone line'));
+      row.append(el('i', 'lamp'), what);
+      sec.append(row);
+    }
+    out.push(sec);
+  }
+  return out;
+}
+
 function renderList() {
+  if (!state.listed && state.pc && (state.link === 'connecting' || state.link === 'online')) {
+    $('groups').replaceChildren(...skeleton());
+    $('empty').hidden = true;
+    return;
+  }
   const out = [];
   for (const g of grouped()) {
     const sec = el('section', 'group');
@@ -717,7 +745,13 @@ async function resendPush() {
   } catch {}
 }
 
+// The screen's text size is kept as an offset from the base size, so a
+// size saved before pinching (whole steps from the A buttons) still reads.
+const BASE_TEXT = 13;
+const MIN_TEXT = 8;
+const MAX_TEXT = 28;
 let zoom = Number(localStorage.getItem('horadric.textzoom')) || 0;
+const textSize = () => Math.max(MIN_TEXT, Math.min(MAX_TEXT, BASE_TEXT + zoom));
 
 // A PC terminal is 150 columns or more and a phone fits about 45 readable
 // ones. Shrinking the PC's width to the phone made text too small to read,
@@ -808,8 +842,7 @@ function renderScreen() {
   const pre = $('screen');
   const wrap = $('screenwrap');
   const atBottom = wrap.scrollHeight - wrap.scrollTop - wrap.clientHeight < 40;
-  const size = Math.max(9, Math.min(22, 13 + zoom));
-  pre.style.fontSize = size + 'px';
+  pre.style.fontSize = textSize() + 'px';
   const cols = Math.max(20, Math.floor((pre.clientWidth - 12) / cellWidth(pre)));
   if (sc) {
     // A PC before colours sends no styles, and its lines draw plain.
@@ -827,10 +860,47 @@ function renderScreen() {
 
 // Navigation
 
+// How deep a view sits, so going deeper slides in from the right and back
+// slides the other way.
+const DEPTH = { unpaired: 0, list: 0, projects: 1, session: 1 };
+const still = matchMedia('(prefers-reduced-motion: reduce)');
+
 function show(view) {
+  const from = state.view;
   state.view = view;
+  const leaving = from !== view && !$(from).hidden ? $(from) : null;
+  // Measured while it still shows, since hidden it has no size.
+  const where = leaving && leaving.getBoundingClientRect();
   for (const v of ['unpaired', 'list', 'projects', 'session']) $(v).hidden = v !== view;
   $('back').hidden = view !== 'session' && view !== 'projects';
+  if (leaving) slide(leaving, where, $(view), DEPTH[view] < DEPTH[from] ? 'back' : 'fwd');
+}
+
+// The view going away is pinned where it was and slides out while the new
+// one slides in, so both move together for a moment. A timer ends it, not
+// animationend, which a page in the background may never get.
+const SLIDE_MS = 240;
+function slide(out, where, into, way) {
+  clearTimeout(slide.timer);
+  settle();
+  if (still.matches) return;
+  if (where.height) {
+    out.hidden = false;
+    out.style.top = where.top + 'px';
+    out.style.height = where.height + 'px';
+    out.classList.add('leaving', way);
+  }
+  void into.offsetWidth;
+  into.classList.add('entering', way);
+  slide.timer = setTimeout(settle, SLIDE_MS + 60);
+}
+
+function settle() {
+  for (const v of document.querySelectorAll('.view.leaving, .view.entering')) {
+    v.classList.remove('leaving', 'entering', 'fwd', 'back');
+    v.style.top = v.style.height = '';
+    v.hidden = state.view !== v.id;
+  }
 }
 
 function watch(id) {
@@ -871,6 +941,7 @@ function choose(pc) {
   state.watching = null;
   state.tooOld = false;
   state.folders = null;
+  state.listed = false;
   if (pc) localStorage.setItem('horadric.current', pc.id);
   renderPcs();
   renderTitle();
@@ -885,6 +956,17 @@ function choose(pc) {
 
 // Input
 
+// A short tick where the phone can vibrate: one for a message sent, a
+// double one for an answer to what the agent asked. iOS has no vibrate and
+// stays silent.
+const TICK = { send: 12, answer: [12, 60, 12] };
+function haptic(kind) {
+  if (navigator.vibrate) navigator.vibrate(TICK[kind]);
+}
+
+// The keys that answer a waiting agent: a choice's digit, yes or no.
+const isAnswer = (k) => /^[0-9yn]$/.test(k);
+
 function typeInto(data) {
   if (!state.watching) return;
   send({ t: 'input', id: state.watching, data });
@@ -893,23 +975,84 @@ function typeInto(data) {
 $('keys').addEventListener('click', (ev) => {
   const b = ev.target.closest('button');
   if (!b || !b.dataset.k) return;
+  haptic(isAnswer(b.dataset.k) ? 'answer' : 'send');
   typeInto(b.dataset.k);
 });
 
-$('zoomin').onclick = () => {
-  zoom += 1;
-  localStorage.setItem('horadric.textzoom', zoom);
+// Pinching the screen sizes its text. The text rewraps at every size, so
+// the anchor is how far down the content the fingers' midpoint sits, which
+// rewrapping keeps roughly where it was.
+const pinch = { from: 0, size: 0, at: 0, y: 0, frame: 0 };
+
+function fingers(ev) {
+  const [a, b] = ev.touches;
+  return { gap: Math.hypot(a.clientX - b.clientX, a.clientY - b.clientY), y: (a.clientY + b.clientY) / 2 };
+}
+
+function zoomTo(size, y) {
+  const wrap = $('screenwrap');
+  const top = y - wrap.getBoundingClientRect().top;
+  const at = (wrap.scrollTop + top) / (wrap.scrollHeight || 1);
+  zoom = Math.max(MIN_TEXT, Math.min(MAX_TEXT, size)) - BASE_TEXT;
   renderScreen();
-};
-$('zoomout').onclick = () => {
-  zoom -= 1;
+  wrap.scrollTop = at * wrap.scrollHeight - top;
+}
+
+// Settles on a half pixel, so the size kept is one the page draws again.
+function saveZoom(size, y) {
+  cancelAnimationFrame(pinch.frame);
+  pinch.frame = 0;
+  zoomTo(Math.round(size * 2) / 2, y);
   localStorage.setItem('horadric.textzoom', zoom);
-  renderScreen();
-};
+}
+
+const screenwrap = $('screenwrap');
+screenwrap.addEventListener('touchstart', (ev) => {
+  if (ev.touches.length !== 2) return;
+  const f = fingers(ev);
+  pinch.from = f.gap || 1;
+  pinch.size = textSize();
+  pinch.at = pinch.size;
+  pinch.y = f.y;
+}, { passive: true });
+screenwrap.addEventListener('touchmove', (ev) => {
+  if (ev.touches.length !== 2 || !pinch.from) return;
+  ev.preventDefault();
+  const f = fingers(ev);
+  pinch.at = pinch.size * (f.gap / pinch.from);
+  pinch.y = f.y;
+  // Rewrapping the whole screen costs a layout, so once a frame at most.
+  pinch.frame ||= requestAnimationFrame(() => {
+    pinch.frame = 0;
+    zoomTo(pinch.at, pinch.y);
+  });
+}, { passive: false });
+screenwrap.addEventListener('touchend', (ev) => {
+  if (ev.touches.length >= 2 || !pinch.from) return;
+  pinch.from = 0;
+  saveZoom(pinch.at, pinch.y);
+});
+screenwrap.addEventListener('touchcancel', () => {
+  if (!pinch.from) return;
+  pinch.from = 0;
+  saveZoom(pinch.at, pinch.y);
+});
+// Safari's own pinch gesture would scale the whole page instead.
+document.addEventListener('gesturestart', (ev) => ev.preventDefault());
+// A trackpad pinch on a computer arrives as a wheel with Ctrl held.
+screenwrap.addEventListener('wheel', (ev) => {
+  if (!ev.ctrlKey) return;
+  ev.preventDefault();
+  const size = textSize() * Math.exp(-ev.deltaY / 100);
+  zoomTo(size, ev.clientY);
+  clearTimeout(pinch.idle);
+  pinch.idle = setTimeout(() => saveZoom(size, ev.clientY), 300);
+}, { passive: false });
 
 $('send').addEventListener('submit', (ev) => {
   ev.preventDefault();
   const text = $('text').value;
+  haptic('send');
   if (!text) return typeInto('\r');
   typeInto(text);
   // Enter apart from the text, so the agent sees typing then a key, not a
