@@ -94,7 +94,7 @@ const sessions = [
 ];
 // What the waiting ones ask, as the PC's `ask` has it.
 const asks = {
-  s1: { kind: 'permission', tool: 'Bash', detail: 'npm test', options: [{ label: 'Allow', keys: '1' }, { label: 'Always', keys: '2' }, { label: 'Deny', keys: '3' }] },
+  s1: { kind: 'permission', tool: 'Bash', detail: 'npm test', options: [{ label: 'Yes', keys: '1' }, { label: 'Always', keys: '2' }, { label: 'No', keys: '' }] },
   s4: { kind: 'question', tool: 'AskUserQuestion', detail: 'Which database?', options: [{ label: 'SQLite', keys: '1' }, { label: 'Postgres', keys: '2' }] },
 };
 for (const [sid, ask] of Object.entries(asks)) sessions.find((x) => x.id === sid).ask = { ...ask, since: Math.floor(Date.now() / 1000) - 90 };
