@@ -1,9 +1,9 @@
 // A stand-in for Horadric's PC side, to try the relay and the page without
 // a PC: node test/fakepc.js [relay ws url]. It prints a pairing link,
 // answers hello, lists sessions, projects, folders and quest logs, starts
-// and makes projects, adds quests, takes photos, echoes what the phone
-// types into the watched session's screen, and streams output into the
-// working one.
+// and makes projects, adds quests, takes photos, renames and stops
+// sessions, answers their last reply, echoes what the phone types into
+// the watched session's screen, and streams output into the working one.
 'use strict';
 const crypto = require('crypto');
 const os = require('os');
@@ -194,6 +194,20 @@ function start() {
       log.quests.push({ title, state: 'open', session: null, why: '', notes });
       reply({ t: 'quest_added', project: log.project, title });
       for (const ch of questsTo) ws.send(R.frame(ch, seal(questsMessage())));
+    } else if (msg.t === 'rename') {
+      const s = sessions.find((x) => x.id === msg.id);
+      if (!s) return reply({ t: 'error', text: 'That session is gone.' });
+      s.name = String(msg.name || '').trim() || `claude ${s.id}`;
+      broadcast({ t: 'sessions', list: sessions });
+    } else if (msg.t === 'stop') {
+      const at = sessions.findIndex((x) => x.id === msg.id);
+      if (at < 0) return reply({ t: 'error', text: 'That session is gone.' });
+      sessions.splice(at, 1);
+      broadcast({ t: 'sessions', list: sessions });
+    } else if (msg.t === 'reply') {
+      const s = sessions.find((x) => x.id === msg.id);
+      const text = s && s.id !== 's3' ? `Done with ${s.name}.\n\nAll 42 tests pass. Want me to ship it?` : null;
+      setTimeout(() => reply({ t: 'reply', id: msg.id, text }), 400);
     } else if (msg.t === 'push') {
       subs.set(msg.sub.endpoint, msg.sub);
       console.log('push subscription', msg.sub.endpoint.slice(0, 60));
