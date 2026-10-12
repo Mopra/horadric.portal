@@ -42,6 +42,7 @@
 <main id="list" class="view" hidden>
   <div id="note" class="note" hidden></div>
   <div class="tools"><button id="openproject" class="pill">Open project</button></div>
+  <div id="inbox" hidden></div>
   <div id="groups"></div>
   <div id="empty" class="dim center" hidden>No sessions on this PC.</div>
   <footer class="foot">
@@ -96,6 +97,13 @@
     <button type="submit">Send</button>
   </form>
 </main>
+
+<div id="sheet" class="sheet" hidden>
+  <div class="sheetbox" role="dialog" aria-modal="true" aria-labelledby="sheettitle">
+    <div id="sheettitle" class="sheettitle"></div>
+    <div id="sheetbody"></div>
+  </div>
+</div>
 
 <script src="/app.js"></script>
 </body>

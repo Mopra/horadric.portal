@@ -1,8 +1,9 @@
 // A stand-in for Horadric's PC side, to try the relay and the page without
 // a PC: node test/fakepc.js [relay ws url]. It prints a pairing link,
 // answers hello, lists sessions, projects and folders, starts and makes
-// projects, takes photos, echoes what the phone types into the watched
-// session's screen, and streams output into the working one.
+// projects, takes photos, renames and stops sessions, answers their last
+// reply, echoes what the phone types into the watched session's screen,
+// and streams output into the working one.
 'use strict';
 const crypto = require('crypto');
 const os = require('os');
@@ -88,8 +89,15 @@ function startSession(path, reply) {
 const sessions = [
   { id: 's1', name: 'relay', project: 'horadric.portal', phase: 'waiting', line: 'Bash: npm test', ask: { kind: 'permission', tool: 'Bash', options: [{ label: 'Yes', keys: '1' }, { label: 'No', keys: '2' }] } },
   { id: 's2', name: 'ui', project: 'horadric.dev', phase: 'working', line: 'Editing app.rs' },
+  { id: 's4', name: 'pick', project: 'horadric.dev', phase: 'waiting', line: 'Question' },
   { id: 's3', name: 'docs', project: 'horadric.dev', phase: 'idle', line: '', paused: true },
 ];
+// What the waiting ones ask, as the PC's `ask` has it.
+const asks = {
+  s1: { kind: 'permission', tool: 'Bash', detail: 'npm test', options: [{ label: 'Allow', keys: '1' }, { label: 'Always', keys: '2' }, { label: 'Deny', keys: '3' }] },
+  s4: { kind: 'question', tool: 'AskUserQuestion', detail: 'Which database?', options: [{ label: 'SQLite', keys: '1' }, { label: 'Postgres', keys: '2' }] },
+};
+for (const [sid, ask] of Object.entries(asks)) sessions.find((x) => x.id === sid).ask = { ...ask, since: Math.floor(Date.now() / 1000) - 90 };
 const screens = {};
 for (const s of sessions) {
   screens[s.id] = [`Session ${s.name}`, ''.padEnd(100, '-'), ...Array.from({ length: 40 }, (_, i) => `line ${i} of ${s.name}`), '> '];
@@ -156,6 +164,20 @@ function start() {
         broadcast({ t: 'sessions', list: sessions });
         for (const [ch, sid] of watching) if (sid === s.id) sendScreen(ch, sid);
       }, 1000);
+    } else if (msg.t === 'rename') {
+      const s = sessions.find((x) => x.id === msg.id);
+      if (!s) return reply({ t: 'error', text: 'That session is gone.' });
+      s.name = String(msg.name || '').trim() || `claude ${s.id}`;
+      broadcast({ t: 'sessions', list: sessions });
+    } else if (msg.t === 'stop') {
+      const at = sessions.findIndex((x) => x.id === msg.id);
+      if (at < 0) return reply({ t: 'error', text: 'That session is gone.' });
+      sessions.splice(at, 1);
+      broadcast({ t: 'sessions', list: sessions });
+    } else if (msg.t === 'reply') {
+      const s = sessions.find((x) => x.id === msg.id);
+      const text = s && s.id !== 's3' ? `Done with ${s.name}.\n\nAll 42 tests pass. Want me to ship it?` : null;
+      setTimeout(() => reply({ t: 'reply', id: msg.id, text }), 400);
     } else if (msg.t === 'push') {
       subs.set(msg.sub.endpoint, msg.sub);
       console.log('push subscription', msg.sub.endpoint.slice(0, 60));
@@ -166,6 +188,14 @@ function start() {
     } else if (msg.t === 'input') {
       const lines = screens[msg.id];
       if (!lines) return;
+      const asked = sessions.find((x) => x.id === msg.id);
+      if (asked && asked.ask && /^[0-9]$/.test(msg.data)) {
+        setTimeout(() => {
+          asked.phase = 'working';
+          delete asked.ask;
+          broadcast({ t: 'sessions', list: sessions });
+        }, 1500);
+      }
       const shown = JSON.stringify(msg.data);
       if (msg.data === '\r') lines.push('> ');
       else lines[lines.length - 1] += msg.data.length === 1 && msg.data >= ' ' ? msg.data : msg.data.length > 1 && !msg.data.startsWith('\u001b') ? msg.data : shown;
