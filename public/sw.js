@@ -42,8 +42,17 @@ function payload(ev) {
   }
 }
 
+// Up to two answers the push offers, {label, keys}, shown as the
+// notification's buttons where the browser has them. An older PC sends
+// none.
+function options(d) {
+  const list = Array.isArray(d.options) ? d.options : [];
+  return list.filter((o) => o && typeof o.label === 'string' && o.label && typeof o.keys === 'string').slice(0, 2);
+}
+
 self.addEventListener('push', (ev) => {
   const d = payload(ev);
+  const answers = d ? options(d) : [];
   const shown = d
     ? self.registration.showNotification(d.title, {
         body: typeof d.body === 'string' ? d.body : '',
@@ -51,7 +60,13 @@ self.addEventListener('push', (ev) => {
         renotify: true,
         icon: '/icon.png',
         badge: '/icon.png',
-        data: { id: d.id, pc: typeof d.pc === 'string' ? d.pc : '' },
+        actions: answers.map((o, i) => ({ action: String(i), title: o.label })),
+        data: {
+          id: d.id,
+          pc: typeof d.pc === 'string' ? d.pc : '',
+          options: answers,
+          since: Number.isFinite(d.since) ? d.since : 0,
+        },
       })
     : self.registration.showNotification('Horadric', {
         body: 'A session waits for you',
@@ -67,17 +82,27 @@ self.addEventListener('push', (ev) => {
   ev.waitUntil(Promise.all([shown, badge]));
 });
 
-// Opens the page on the session the notification is about. A page already
-// open is told, since navigating it would cost its connection.
+// Opens the page on the session the notification is about, with the
+// answer when one of its buttons was tapped: `a` the keys to type, `l` the
+// label, `w` when the wait began, so the page sends it only to that wait.
+// A page already open is told, since navigating it would cost its
+// connection.
 self.addEventListener('notificationclick', (ev) => {
   ev.notification.close();
   const d = ev.notification.data || {};
-  const url = d.id ? '/#' + new URLSearchParams({ s: d.id, pc: d.pc || '' }) : '/';
+  const picked = ev.action && Array.isArray(d.options) ? d.options[Number(ev.action)] : null;
+  const open = { s: d.id, pc: d.pc || '' };
+  if (picked) Object.assign(open, { a: picked.keys, l: picked.label, w: String(d.since || 0) });
+  const url = d.id ? '/#' + new URLSearchParams(open) : '/';
   ev.waitUntil(
     self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then((list) => {
       const mine = list.find((c) => new URL(c.url).origin === location.origin);
       if (!mine) return self.clients.openWindow(url);
-      if (d.id) mine.postMessage({ t: 'open', id: d.id, pc: d.pc || '' });
+      if (d.id) {
+        const msg = { t: 'open', id: d.id, pc: d.pc || '' };
+        if (picked) msg.answer = { keys: picked.keys, label: picked.label, since: d.since || 0 };
+        mine.postMessage(msg);
+      }
       return mine.focus();
     }),
   );

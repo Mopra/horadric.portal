@@ -52,7 +52,8 @@ test('a push with a payload says what waits, tagged by session, and sets the bad
   assert.strictEqual(n.title, 'Allow Bash?');
   assert.strictEqual(n.body, 'horadric · ui');
   assert.strictEqual(n.tag, 'horadric-s9');
-  assert.deepStrictEqual(n.data, { id: 's9', pc: 'p1' });
+  assert.deepStrictEqual(n.data, { id: 's9', pc: 'p1', options: [], since: 0 });
+  assert.deepStrictEqual(n.actions, []);
   assert.deepStrictEqual(w.seen.badges, [3]);
 });
 
@@ -73,7 +74,7 @@ test('a browser without badges still shows the push', async () => {
   assert.strictEqual(w.seen.shown.length, 1);
 });
 
-const click = (data) => ({ notification: { data, close() {} } });
+const click = (data, action = '') => ({ action, notification: { data, close() {} } });
 
 test('a click with no page open opens it on the session', async () => {
   const w = worker();
@@ -93,4 +94,51 @@ test('a click on an old push opens the page as before', async () => {
   const w = worker();
   await w.fire('notificationclick', click(undefined));
   assert.deepStrictEqual(w.seen.opened, ['/']);
+});
+
+test('a push with options shows up to two as buttons, keeping their keys', async () => {
+  const w = worker();
+  const options = [
+    { label: 'Yes', keys: '1' },
+    { label: 'No', keys: '\u001b' },
+    { label: 'Third', keys: '3' },
+  ];
+  await w.fire('push', push({ pc: 'p1', id: 's9', title: 'Allow Bash?', waiting: 1, options, since: 1760000000 }));
+  const n = w.seen.shown[0];
+  assert.deepStrictEqual(n.actions, [
+    { action: '0', title: 'Yes' },
+    { action: '1', title: 'No' },
+  ]);
+  assert.deepStrictEqual(n.data.options, options.slice(0, 2));
+  assert.strictEqual(n.data.since, 1760000000);
+});
+
+test('a push without options, or with broken ones, has no buttons', async () => {
+  for (const options of [undefined, 'x', [null, { label: '' , keys: '1' }, { label: 'Yes' }]]) {
+    const w = worker();
+    await w.fire('push', push({ id: 's1', title: 'Waiting for you', options }));
+    assert.deepStrictEqual(w.seen.shown[0].actions, []);
+  }
+});
+
+const offered = { id: 's9', pc: 'p1', since: 1760000000, options: [{ label: 'Yes', keys: '1' }, { label: 'No', keys: '\u001b' }] };
+
+test('a button with no page open opens the page with the answer in the fragment', async () => {
+  const w = worker();
+  await w.fire('notificationclick', click(offered, '1'));
+  assert.strictEqual(w.seen.opened.length, 1);
+  const p = new URLSearchParams(w.seen.opened[0].slice(2));
+  assert.deepStrictEqual(Object.fromEntries(p), { s: 's9', pc: 'p1', a: '\u001b', l: 'No', w: '1760000000' });
+});
+
+test('a button with the page open tells it the answer', async () => {
+  const w = worker({ clients: ['https://portal.horadric.dev/'] });
+  await w.fire('notificationclick', click(offered, '0'));
+  assert.deepStrictEqual(w.seen.posted, [{ t: 'open', id: 's9', pc: 'p1', answer: { keys: '1', label: 'Yes', since: 1760000000 } }]);
+});
+
+test('a click on the body of a push with buttons only opens the session', async () => {
+  const w = worker();
+  await w.fire('notificationclick', click(offered));
+  assert.deepStrictEqual(w.seen.opened, ['/#s=s9&pc=p1']);
 });
