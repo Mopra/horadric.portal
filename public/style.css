@@ -223,8 +223,7 @@ code { font-family: ui-monospace, "Cascadia Mono", Menlo, monospace; color: var(
   display: flex;
   align-items: center;
 }
-#send .clip.busy { color: var(--gold); animation: pulse 1s ease-in-out infinite alternate; }
-@keyframes pulse { to { opacity: 0.4; } }
+#send .clip.busy { color: var(--gold); animation: pulse 1s ease-in-out infinite; }
 @media (prefers-reduced-motion: reduce) { #send .clip.busy { animation: none; } }
 #send button:not(.clip) {
   padding: 0 16px;
