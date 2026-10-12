@@ -157,6 +157,7 @@ const state = {
   sheet: null, // the long press menu, see openSheet
   replyWait: null, // { id, resolve, reject, timer } while a reply is asked for
   listed: false, // a sessions answer came from this PC, so the list is real
+  sent: new Map(), // session id -> { label, since }: an inbox answer sent, until the phase moves
 };
 
 function setLink(link) {
@@ -371,6 +372,7 @@ function onMessage(msg) {
     case 'sessions':
       state.listed = true;
       state.sessions = Array.isArray(msg.list) ? msg.list : [];
+      pruneSent();
       renderList();
       renderTitle();
       renderBadge();
@@ -452,6 +454,20 @@ function renderNote() {
   note.textContent = text;
 }
 
+// Sessions waiting on the human, longest wait first, and the count in the
+// tab title and the page's title bar.
+const waitingList = () =>
+  state.sessions
+    .filter((s) => phaseOf(s) === 'waiting' && !s.paused)
+    .sort((a, b) => (askSince(a) || Infinity) - (askSince(b) || Infinity));
+
+// `since` as seconds or milliseconds since the epoch, whichever the PC sent.
+function askSince(s) {
+  const t = Number(s.ask && s.ask.since);
+  if (!t) return 0;
+  return t < 1e12 ? t * 1000 : t;
+}
+
 // Esc, Ctrl+C, arrows and Tab always fit. y, n and the digits answer a
 // prompt, so they show only while the session waits, and the digits only as
 // many as its `ask` has options (1 to 3 when an older PC sends no `ask`).
@@ -465,6 +481,9 @@ function renderKeys(s) {
 }
 
 function renderTitle() {
+  renderDots();
+  const n = waitingList().length;
+  document.title = n ? `(${n}) Horadric` : 'Horadric';
   if (state.view === 'diff') {
     $('title').textContent = baseName(state.diffPath || '') || 'Changes';
   } else if (state.watching) {
@@ -474,7 +493,7 @@ function renderTitle() {
   } else if (state.view === 'projects') {
     $('title').textContent = 'Open project';
   } else {
-    $('title').textContent = state.pc ? state.pc.n : 'Horadric';
+    $('title').textContent = (state.pc ? state.pc.n : 'Horadric') + (n ? ` (${n} waiting)` : '');
   }
 }
 
@@ -561,7 +580,73 @@ function skeleton() {
   return out;
 }
 
+// "5s", "3m", "2h": how long a card has waited.
+function ago(since) {
+  const sec = Math.max(0, Math.floor((Date.now() - since) / 1000));
+  if (sec < 60) return sec + 's';
+  if (sec < 3600) return Math.floor(sec / 60) + 'm';
+  return Math.floor(sec / 3600) + 'h';
+}
+
+// An answer is "Sent" until the session leaves that wait: its phase moves, or
+// a new ask replaces the one answered.
+function pruneSent() {
+  for (const [id, sent] of state.sent) {
+    const s = state.sessions.find((x) => x.id === id);
+    if (!s || phaseOf(s) !== 'waiting' || askSince(s) !== sent.since) state.sent.delete(id);
+  }
+}
+
+function answer(s, opt) {
+  haptic('answer');
+  state.sent.set(s.id, { label: opt.label, since: askSince(s) });
+  send({ t: 'input', id: s.id, data: opt.keys });
+  renderInbox();
+}
+
+function card(s) {
+  const ask = s.ask && typeof s.ask === 'object' ? s.ask : null;
+  const c = el('article', 'card');
+  const top = el('div', 'ctop');
+  top.append(el('span', 'cproj', s.project ? baseName(s.project) : s.name || s.id));
+  const since = askSince(s);
+  if (since) top.append(el('span', 'cage', ago(since)));
+  c.append(top);
+  const what = ask ? [ask.tool, ask.detail].filter(Boolean).join(': ') : '';
+  c.append(el('div', 'cwhat', what || s.line || 'Waiting for you'));
+  const row = el('div', 'cbtns');
+  const sent = state.sent.get(s.id);
+  const options = ask && Array.isArray(ask.options) ? ask.options.filter((o) => o && o.label && typeof o.keys === 'string') : [];
+  if (sent) {
+    row.append(el('span', 'csent', `Sent: ${sent.label}`));
+  } else {
+    for (const o of options) {
+      const b = el('button', 'pill', o.label);
+      b.onclick = () => answer(s, o);
+      row.append(b);
+    }
+  }
+  const open = el('button', 'link', 'Open');
+  open.onclick = () => watch(s.id);
+  row.append(open);
+  c.append(row);
+  return c;
+}
+
+function renderInbox() {
+  const list = waitingList();
+  $('inbox').hidden = !list.length;
+  $('inbox').replaceChildren(...list.map(card));
+  renderTitle();
+}
+
+// The ages move on their own.
+setInterval(() => {
+  if (state.view === 'list' && !document.hidden) renderInbox();
+}, 15000);
+
 function renderList() {
+  renderInbox();
   if (!state.listed && state.pc && (state.link === 'connecting' || state.link === 'online')) {
     $('groups').replaceChildren(...skeleton());
     $('empty').hidden = true;
@@ -1381,6 +1466,55 @@ document.addEventListener('keydown', (ev) => {
 
 // Navigation
 
+// The sessions of the project the open one belongs to, in the list's order.
+function siblings() {
+  const g = grouped().find((x) => x.list.some((s) => s.id === state.watching));
+  return g ? g.list : [];
+}
+
+// One dot per session of the project, the open one lit. Shown only when
+// there is somebody to swipe to.
+function renderDots() {
+  const list = state.watching ? siblings() : [];
+  const box = $('dots');
+  box.hidden = list.length < 2;
+  box.replaceChildren(...list.map((s) => el('i', s.id === state.watching ? 'on' : '')));
+}
+
+// The screen slides in from the side the swipe came from.
+function swipeIn(way) {
+  const box = $('screenbox');
+  box.classList.remove('swipe-next', 'swipe-prev');
+  if (still.matches) return;
+  void box.offsetWidth;
+  box.classList.add(way === 'next' ? 'swipe-next' : 'swipe-prev');
+}
+
+// A horizontal swipe on the screen goes to the next or previous session of
+// the project. Two fingers are the pinch's, and a mostly vertical move is
+// scrolling.
+const swipe = { x: 0, y: 0, live: false };
+$('screenwrap').addEventListener('touchstart', (ev) => {
+  swipe.live = ev.touches.length === 1;
+  if (swipe.live) [swipe.x, swipe.y] = [ev.touches[0].clientX, ev.touches[0].clientY];
+}, { passive: true });
+$('screenwrap').addEventListener('touchmove', (ev) => {
+  if (ev.touches.length > 1) swipe.live = false;
+}, { passive: true });
+$('screenwrap').addEventListener('touchend', (ev) => {
+  if (!swipe.live || ev.changedTouches.length !== 1) return;
+  swipe.live = false;
+  const dx = ev.changedTouches[0].clientX - swipe.x;
+  const dy = ev.changedTouches[0].clientY - swipe.y;
+  if (Math.abs(dx) < 70 || Math.abs(dx) < 2 * Math.abs(dy)) return;
+  // Selecting text is not a swipe.
+  if (String(getSelection()).length) return;
+  const list = siblings();
+  const at = list.findIndex((s) => s.id === state.watching);
+  const to = list[at + (dx < 0 ? 1 : -1)];
+  if (to) watch(to.id, dx < 0 ? 'next' : 'prev');
+});
+
 // How deep a view sits, so going deeper slides in from the right and back
 // slides the other way.
 const DEPTH = { unpaired: 0, list: 0, projects: 1, session: 1, diff: 2 };
@@ -1424,7 +1558,7 @@ function settle() {
   }
 }
 
-function watch(id) {
+function watch(id, way) {
   const again = state.watching === id;
   // A session started from the projects view takes that view's place in
   // history, so back goes to the session list.
@@ -1445,6 +1579,7 @@ function watch(id) {
   send({ t: 'watch', id });
   renderChanges();
   askChanges();
+  if (way) swipeIn(way);
   // One history entry for the session view, whichever session it shows.
   if (swap) history.replaceState({ session: id }, '');
   else if (!again) history.pushState({ session: id }, '');
