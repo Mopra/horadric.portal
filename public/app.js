@@ -1762,7 +1762,9 @@ function slide(out, where, into, way) {
   if (still.matches) return;
   if (where.height) {
     out.hidden = false;
-    out.style.top = where.top + 'px';
+    // The body is the leaving view's frame, since it is moved to where
+    // the keyboard left the page, so the top is measured from it.
+    out.style.top = where.top - document.body.getBoundingClientRect().top + 'px';
     out.style.height = where.height + 'px';
     out.classList.add('leaving', way);
   }
@@ -2142,6 +2144,38 @@ window.addEventListener('online', wake);
 $('notify').onclick = enablePush;
 $('resume').onclick = () => state.watching && resume(state.watching);
 window.addEventListener('resize', () => state.watching && renderScreen());
+
+// iOS lays the keyboard over the page instead of shrinking it, and pans
+// the page to bring the input into view, so the keys and the screen's last
+// lines end up under the keyboard. The page is sized to the part of the
+// screen that is still visible instead, and moved to wherever iOS panned.
+// A screen that showed its bottom line before keeps showing it after.
+let stuck = true;
+$('screenwrap').addEventListener('scroll', () => {
+  const w = $('screenwrap');
+  stuck = w.scrollHeight - w.scrollTop - w.clientHeight < 40;
+}, { passive: true });
+
+function fitViewport() {
+  const vv = window.visualViewport;
+  if (!vv) return;
+  const root = document.documentElement.style;
+  // A page the user zoomed in on is left to the browser to pan.
+  const zoomed = vv.scale > 1.01;
+  root.setProperty('--vvh', zoomed ? '' : vv.height + 'px');
+  root.setProperty('--vvtop', zoomed ? '' : vv.offsetTop + 'px');
+  document.body.classList.toggle('kb', !zoomed && window.innerHeight - vv.height > 120);
+  if (stuck) {
+    const w = $('screenwrap');
+    w.scrollTop = w.scrollHeight;
+  }
+}
+
+if (window.visualViewport) {
+  visualViewport.addEventListener('resize', fitViewport);
+  visualViewport.addEventListener('scroll', fitViewport);
+  fitViewport();
+}
 
 // Start
 

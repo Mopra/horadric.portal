@@ -25,7 +25,12 @@ body {
   font: 15px/1.4 -apple-system, "Segoe UI", Roboto, system-ui, sans-serif;
   display: flex;
   flex-direction: column;
-  height: 100dvh;
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: var(--vvh, 100dvh);
+  transform: translateY(var(--vvtop, 0));
   overflow: hidden;
   -webkit-tap-highlight-color: transparent;
 }
@@ -585,3 +590,6 @@ html { overflow: hidden; }
 }
 .dl.hunk:first-child { margin-top: 0; }
 #diffbody .center { font-family: -apple-system, "Segoe UI", sans-serif; }
+
+/* The keyboard covers the home indicator, so its inset is not needed. */
+body.kb #send { padding-bottom: 8px; }
