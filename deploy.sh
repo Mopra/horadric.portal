@@ -4,7 +4,7 @@
 # the systemd unit and the Traefik route.
 set -e
 HOST="${1:-vps-eu-1}"
-tar czf - server.js relay.js package.json package-lock.json public deploy | ssh "$HOST" '
+tar czf - server.js relay.js auth.js package.json package-lock.json public deploy | ssh "$HOST" '
   set -e
   id horadric >/dev/null 2>&1 || useradd --system --home /opt/horadric-portal --shell /usr/sbin/nologin horadric
   mkdir -p /opt/horadric-portal

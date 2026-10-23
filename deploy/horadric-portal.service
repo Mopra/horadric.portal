@@ -10,6 +10,8 @@ WorkingDirectory=/opt/horadric-portal
 # and it is not reachable from the internet.
 Environment=HOST=10.0.0.1
 Environment=PORT=43200
+# The WorkOS client whose access tokens sign in a PC (staging for now).
+Environment=WORKOS_CLIENT_ID=client_01M5NBZGDSBPJMPR5BSJQ9ASEA
 ExecStart=/usr/bin/node server.js
 Restart=always
 RestartSec=2
