@@ -68,9 +68,8 @@ test('expired, wrong issuer, wrong client, forged and none tokens are refused', 
   await rejects(verify(sign(keyA, claimsFor('u'), { alg: 'HS256' })), 'wrong algorithm');
   await rejects(verify('not.a.jwt'), 'malformed token');
   await rejects(verify('x'.repeat(9000)), 'malformed token');
-  // The trailing slash form and the per client form are both WorkOS's own.
-  await verify(sign(keyA, claimsFor('u', { iss: 'https://api.workos.com/' })));
-  await verify(sign(keyA, claimsFor('u', { iss: `https://api.workos.com/user_management/${CLIENT}` })));
+  // Only the per client issuer a real token carries, not the bare host.
+  await rejects(verify(sign(keyA, claimsFor('u', { iss: 'https://api.workos.com' }))), 'wrong issuer');
 });
 
 test('an unknown kid refetches the keys, but not more than once per cooldown', async () => {
