@@ -8,7 +8,7 @@ const { createVerifier, AuthError, jwksUrl } = require('../auth');
 const { createRelay, CLOSE_BAD_TOKEN, CLOSE_AUTH_DOWN } = require('../server');
 
 const CLIENT = 'client_test';
-const ISS = 'https://api.workos.com';
+const ISS = `https://api.workos.com/user_management/${CLIENT}`;
 
 function keyPair(kid) {
   const { privateKey, publicKey } = crypto.generateKeyPairSync('rsa', { modulusLength: 2048 });

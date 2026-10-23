@@ -28,16 +28,11 @@ function jwksUrl(clientId) {
   return `https://api.workos.com/sso/jwks/${encodeURIComponent(clientId)}`;
 }
 
-// WorkOS's docs show the issuer both with and without a trailing slash,
-// and older environments sign with a per client user_management issuer.
-// All are bound to our keys by the JWKS anyway; WORKOS_ISSUER overrides
-// them for a custom auth domain.
+// A real AuthKit access token, checked on 2026-10-24, carries the per
+// client user_management issuer. WORKOS_ISSUER overrides it for a custom
+// auth domain.
 function defaultIssuers(clientId) {
-  return [
-    'https://api.workos.com',
-    'https://api.workos.com/',
-    `https://api.workos.com/user_management/${clientId}`,
-  ];
+  return [`https://api.workos.com/user_management/${clientId}`];
 }
 
 function b64json(part) {

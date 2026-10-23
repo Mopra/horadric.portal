@@ -38,7 +38,6 @@ The token is an RS256 JWT, checked with Node's own `crypto` against the
 keys at `https://api.workos.com/sso/jwks/<WORKOS_CLIENT_ID>` (cached, and
 fetched again for an unknown key id at most every 10 seconds). It must
 not be expired (5 seconds of slack), its `iss` must be
-`https://api.workos.com` (with or without the slash) or
 `https://api.workos.com/user_management/<client id>`, or one of
 `WORKOS_ISSUER` (comma separated) when set, a `client_id` claim must be
 ours, and `sub` is the user. A refused token closes the socket at once:
