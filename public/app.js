@@ -421,6 +421,10 @@ function onMessage(msg) {
     case 'sessions':
       state.listed = true;
       state.sessions = Array.isArray(msg.list) ? msg.list : [];
+      // A silent brother's sessions this PC can take over, apart from its
+      // own so nothing else treats them as the PC's.
+      state.take = Array.isArray(msg.take) ? msg.take : [];
+      if (state.taking && !state.take.some((x) => x.id === state.taking)) state.taking = null;
       pruneSent();
       sendHeldAnswer();
       renderList();
@@ -483,6 +487,10 @@ function onMessage(msg) {
         state.starting = null;
         renderList();
         renderFolders();
+      }
+      if (state.taking) {
+        state.taking = null;
+        renderList();
       }
       if (state.added) {
         state.added = null;
@@ -710,6 +718,8 @@ function renderList() {
     return;
   }
   const out = [];
+  const take = state.take || [];
+  if (take.length) out.push(takeSection(take));
   for (const g of grouped()) {
     const sec = el('section', 'group');
     const head = el('div', 'ghead');
@@ -753,6 +763,33 @@ function renderList() {
   }
   $('groups').replaceChildren(...out);
   $('empty').hidden = out.length > 0 || state.link !== 'online';
+}
+
+// A silent brother's sessions, each with "Take over": the PC asks to
+// have it handed to itself, which for a brother that does not answer is
+// taking it over from what the PC keeps of it.
+function takeSection(take) {
+  const sec = el('section', 'group');
+  const head = el('div', 'ghead');
+  head.append(el('h2', null, 'Silent brothers'));
+  sec.append(head);
+  for (const s of take) {
+    const b = el('div', 'sess paused');
+    const what = el('div', 'what');
+    const where = s.project ? `${s.project} · ` : '';
+    what.append(el('div', 'name', s.name || s.id), el('div', 'line', where + (s.line || 'silent')));
+    b.append(el('i', 'lamp paused'), what);
+    const r = el('button', 'resume', state.taking === s.id ? 'Taking over...' : 'Take over');
+    r.disabled = !!state.taking || state.link !== 'online';
+    r.onclick = () => {
+      state.taking = s.id;
+      send({ t: 'handoff', id: s.id, to: s.to });
+      renderList();
+    };
+    b.append(r);
+    sec.append(b);
+  }
+  return sec;
 }
 
 // Starting and resuming
