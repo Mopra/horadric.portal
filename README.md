@@ -35,7 +35,7 @@ Without `token` the PC is a v2 PC, served exactly as before, and
 `name` is ignored.
 
 The token is an RS256 JWT, checked with Node's own `crypto` against the
-keys at `https://api.workos.com/sso/jwks/<WORKOS_CLIENT_ID>` (cached, and
+keys at `https://api.workos.com/sso/jwks/<client id>` (`WORKOS_CLIENT_ID` may list several, comma separated: production for installs, staging for dev instances; the token's `client_id` picks one) (cached, and
 fetched again for an unknown key id at most every 10 seconds). It must
 not be expired (5 seconds of slack), its `iss` must be
 `https://api.workos.com/user_management/<client id>`, or one of

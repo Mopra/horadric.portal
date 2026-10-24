@@ -133,4 +133,20 @@ function createVerifier(options) {
   };
 }
 
-module.exports = { AuthError, createVerifier, jwksUrl, defaultIssuers };
+// One verifier per WorkOS client: installs sign in with the production
+// client, dev instances with staging, and each has its own keys and
+// issuer. The token's own client_id picks one; its signature then decides.
+function createVerifiers(clientIds, options = {}) {
+  const byId = new Map(clientIds.map((id) => [id, createVerifier({ ...options, clientId: id })]));
+  return async function verify(token) {
+    if (byId.size === 0) throw new AuthError('sign in is not set up on this relay', true);
+    const parts = typeof token === 'string' ? token.split('.') : [];
+    const claims = parts.length === 3 ? b64json(parts[1]) : null;
+    const id = claims && typeof claims === 'object' ? claims.client_id : undefined;
+    const one = byId.size === 1 ? [...byId.values()][0] : byId.get(id);
+    if (!one) throw new AuthError(parts.length === 3 ? 'wrong client' : 'malformed token');
+    return one(token);
+  };
+}
+
+module.exports = { AuthError, createVerifier, createVerifiers, jwksUrl, defaultIssuers };

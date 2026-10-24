@@ -4,7 +4,7 @@ const assert = require('node:assert');
 const crypto = require('crypto');
 const WebSocket = require('ws');
 const R = require('../relay');
-const { createVerifier, AuthError, jwksUrl } = require('../auth');
+const { createVerifier, createVerifiers, AuthError, jwksUrl } = require('../auth');
 const { createRelay, CLOSE_BAD_TOKEN, CLOSE_AUTH_DOWN } = require('../server');
 
 const CLIENT = 'client_test';
@@ -287,4 +287,16 @@ test('a join opens a channel between two brothers and frames pass both ways', as
   } finally {
     await r.close();
   }
+});
+
+test('two clients: each token is checked against its own client', async () => {
+  const src = jwksSource([keyA]);
+  const verify = createVerifiers(['client_prod', CLIENT], { fetchJwks: src.fetch });
+  const claims = await verify(sign(keyA, claimsFor('u', {})));
+  assert.strictEqual(claims.sub, 'u');
+  const prod = { iss: 'https://api.workos.com/user_management/client_prod', client_id: 'client_prod' };
+  assert.strictEqual((await verify(sign(keyA, claimsFor('p', prod)))).sub, 'p');
+  await assert.rejects(verify(sign(keyA, claimsFor('x', { client_id: 'client_other' }))), /wrong client/);
+  // A token naming one client but issued for the other is refused.
+  await assert.rejects(verify(sign(keyA, claimsFor('y', { client_id: 'client_prod' }))), /wrong issuer/);
 });

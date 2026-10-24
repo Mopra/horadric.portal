@@ -8,7 +8,7 @@ const fs = require('fs');
 const path = require('path');
 const { WebSocketServer } = require('ws');
 const R = require('./relay');
-const { createVerifier, AuthError } = require('./auth');
+const { createVerifiers, AuthError } = require('./auth');
 
 const PUBLIC = path.join(__dirname, 'public');
 
@@ -39,8 +39,7 @@ function reject(socket, code) {
 function createRelay(options = {}) {
   const verify =
     options.verify ||
-    createVerifier({
-      clientId: process.env.WORKOS_CLIENT_ID,
+    createVerifiers((process.env.WORKOS_CLIENT_ID || '').split(',').filter(Boolean), {
       issuers: process.env.WORKOS_ISSUER ? process.env.WORKOS_ISSUER.split(',') : undefined,
     });
 
