@@ -128,6 +128,50 @@ test('control messages from a PC are parsed, anything else dropped', () => {
   assert.strictEqual(R.parseControl(Buffer.from('{"close":0}')), null);
   assert.strictEqual(R.parseControl(Buffer.from('{"close":4294967295}')), null);
   assert.strictEqual(R.parseControl(Buffer.from('nope')), null);
+  // A fresh token fits, though it is longer than any other control.
+  const token = 'x'.repeat(8192);
+  assert.deepStrictEqual(R.parseControl(Buffer.from(JSON.stringify({ token }))), { token });
+  assert.strictEqual(R.parseControl(Buffer.from('{"token":""}')), null);
+  assert.strictEqual(R.parseControl(Buffer.from('{"token":7}')), null);
+  assert.strictEqual(R.parseControl(Buffer.from(JSON.stringify({ token: 'x'.repeat(10000) }))), null);
+});
+
+test('a socket that can refresh closes at exp plus grace, one that cannot not before QUERY_UNTIL', () => {
+  const exp = 1_790_000_000;
+  assert.strictEqual(R.closeAt(exp, true), exp * 1000 + R.EXPIRY_GRACE);
+  assert.strictEqual(R.EXPIRY_GRACE, 120_000);
+  assert.strictEqual(R.closeAt(exp, false), R.QUERY_UNTIL);
+  // Past QUERY_UNTIL the same rule holds for both.
+  const late = R.QUERY_UNTIL / 1000 + 3600;
+  assert.strictEqual(R.closeAt(late, false), R.closeAt(late, true));
+});
+
+test('users not seen for 90 days are forgotten, and past the cap the ones seen longest ago', () => {
+  const day = 24 * 3600 * 1000;
+  const t = 1000 * day;
+  const ids = () => new Map([['a'.repeat(32), { at: 0, n: 0 }]]);
+  const seen = new Map();
+  const last = new Map();
+  for (const [sub, at] of [['stale', t - 91 * day], ['stale but on', t - 200 * day], ['recent', t - 89 * day]]) {
+    seen.set(sub, ids());
+    last.set(sub, at);
+  }
+  assert.strictEqual(R.pruneSeen(seen, last, t, new Set(['stale but on'])), 1);
+  assert.deepStrictEqual([...seen.keys()].sort(), ['recent', 'stale but on']);
+  assert.ok(!last.has('stale'));
+
+  seen.clear();
+  last.clear();
+  for (let i = 0; i < R.MAX_USERS + 5; i++) {
+    seen.set(`u${i}`, ids());
+    last.set(`u${i}`, t - i * 1000);
+  }
+  // The oldest one is connected, so it stays and the five next oldest go.
+  const oldest = `u${R.MAX_USERS + 4}`;
+  assert.strictEqual(R.pruneSeen(seen, last, t, new Set([oldest])), 5);
+  assert.strictEqual(seen.size, R.MAX_USERS);
+  assert.ok(seen.has(oldest) && seen.has('u0') && !seen.has(`u${R.MAX_USERS + 3}`) && !seen.has(`u${R.MAX_USERS - 1}`));
+  assert.strictEqual(last.size, R.MAX_USERS);
 });
 
 // The sockets, against a relay on a free port with a local JWKS.
@@ -513,15 +557,20 @@ test('the first-seen map survives its file, and a broken entry or an overfull us
   const a = 'a'.repeat(32);
   const b = 'b'.repeat(32);
   const seen = new Map([['user_1', new Map([[a, { at: 5, n: 0 }], [b, { at: 7, n: 1 }]])], ['user_2', new Map()]]);
-  const back = R.seenFromJson(R.seenToJson(seen));
-  assert.deepStrictEqual([...back.keys()], ['user_1']);
-  assert.deepStrictEqual(back.get('user_1'), seen.get('user_1'));
+  const back = R.seenFromJson(R.seenToJson(seen, new Map([['user_1', 900]])));
+  assert.deepStrictEqual([...back.seen.keys()], ['user_1']);
+  assert.deepStrictEqual(back.seen.get('user_1'), seen.get('user_1'));
+  assert.deepStrictEqual([...back.last], [['user_1', 900]]);
   const many = Array.from({ length: 100 }, (_, i) => [i.toString(16).padStart(32, '0'), 1000 - i, i]);
+  // A v1 file, as 59d1947 wrote it, has no last seen: its newest id kept counts.
   const doc = { v: 1, users: { u: [...many, ['nope', 1, 0], [a, 'x', 0]], v: 'not a list' } };
-  const got = R.seenFromJson(JSON.stringify(doc)).get('u');
+  const v1 = R.seenFromJson(JSON.stringify(doc));
+  assert.strictEqual(v1.last.get('u'), 1000 - 99 + R.MAX_SEEN_PER_USER - 1);
+  const got = v1.seen.get('u');
   assert.strictEqual(got.size, R.MAX_SEEN_PER_USER);
   // The oldest are the ones kept.
   assert.ok(got.has(many[99][0]) && !got.has(many[0][0]));
+  assert.throws(() => R.seenFromJson('{"v":3,"users":{}}'));
   assert.throws(() => R.seenFromJson('{"v":2}'));
   assert.throws(() => R.seenFromJson('not json'));
   assert.ok(!R.tooBig(Buffer.alloc(R.MAX_FRAME)) && R.tooBig(Buffer.alloc(R.MAX_FRAME + 1)));
@@ -560,7 +609,7 @@ test('after a restart a machine known before still beats a burst of new secrets'
     await r.close();
   }
   // Closing wrote what the second run learnt, at once.
-  assert.strictEqual(R.seenFromJson(fs.readFileSync(stateFile, 'utf8')).get('user_1').size, R.MAX_PCS_PER_USER + 1);
+  assert.strictEqual(R.seenFromJson(fs.readFileSync(stateFile, 'utf8')).seen.get('user_1').size, R.MAX_PCS_PER_USER + 1);
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
@@ -624,4 +673,129 @@ test('a frame over the limit is dropped in every direction, and no socket closes
   } finally {
     await r.close();
   }
+});
+
+// A relay clock a test moves by hand.
+function handClock() {
+  const c = { t: Date.now() };
+  c.now = () => c.t;
+  return c;
+}
+
+const later = (ms) => new Promise((ok) => setTimeout(ok, ms));
+
+// How Horadric dials /pc when it can hand over a fresh token in band.
+const refreshingPcUrl = (...a) => {
+  const d = pcUrl(...a);
+  d.headers['X-Horadric-Refresh'] = '1';
+  return d;
+};
+
+test('a fresh token on the open socket moves its expiry; refused, foreign and later keep it', async () => {
+  const clock = handClock();
+  const real = createVerifier({ clientId: CLIENT, fetchJwks: jwksSource([keyA]).fetch });
+  let down = false;
+  const verify = (t) => (down ? Promise.reject(new AuthError('cannot reach WorkOS', true)) : real(t));
+  const r = await relay({ now: clock.now, verify, expiryEvery: 10 });
+  try {
+    const exp = nowS() + 300;
+    const pc = connect(refreshingPcUrl(r.base, secrets.one, sign(keyA, claimsFor('user_1', { exp })), 'Desk'));
+    assert.deepStrictEqual(await pc.next(), { brothers: [] });
+    const phone = connect(`${r.base}/phone?id=${R.pcId(secrets.one)}`);
+    await phone.next();
+    const ch = (await pc.next()).open;
+    const brother = connect(pcUrl(r.base, secrets.two, sign(keyA, claimsFor('user_1')), 'Laptop'));
+    await brother.next();
+    await pc.next();
+
+    const fresh = nowS() + 900;
+    pc.send(JSON.stringify({ token: sign(keyA, claimsFor('user_1', { exp: fresh })) }));
+    assert.deepStrictEqual(await pc.next(), { token: 'ok', exp: fresh });
+    pc.send(JSON.stringify({ token: sign(keyA, claimsFor('user_2')) }));
+    assert.deepStrictEqual(await pc.next(), { token: 'refused', why: 'another user' });
+    pc.send(JSON.stringify({ token: sign(keyA, claimsFor('user_1', { exp: nowS() - 60 })) }));
+    assert.deepStrictEqual(await pc.next(), { token: 'refused', why: 'token expired' });
+    pc.send(JSON.stringify({ token: 'not.a.jwt' }));
+    assert.deepStrictEqual(await pc.next(), { token: 'refused', why: 'malformed token' });
+    down = true;
+    pc.send(JSON.stringify({ token: sign(keyA, claimsFor('user_1')) }));
+    assert.deepStrictEqual(await pc.next(), { token: 'later' });
+    down = false;
+
+    // None of it reached the phone or the brother.
+    pc.send(R.frame(ch, Buffer.from('after')));
+    assert.strictEqual((await phone.next()).toString(), 'after');
+    await pingPong(brother);
+    assert.strictEqual(brother.queueLength() + phone.queueLength(), 0);
+
+    // The first token's deadline has passed, the fresh one's has not.
+    clock.t = exp * 1000 + R.EXPIRY_GRACE + 60_000;
+    await later(60);
+    await pingPong(pc);
+    clock.t = fresh * 1000 + R.EXPIRY_GRACE - 1000;
+    await later(60);
+    await pingPong(pc);
+    clock.t = fresh * 1000 + R.EXPIRY_GRACE + 1000;
+    assert.deepStrictEqual(await pc.closed, { code: CLOSE_BAD_TOKEN, reason: 'token expired' });
+    assert.deepStrictEqual(await phone.next(), { relay: 'offline' });
+    assert.deepStrictEqual(await brother.next(), { brothers: [] });
+    phone.close();
+    brother.close();
+  } finally {
+    await r.close();
+  }
+});
+
+test('a socket that cannot refresh stays until QUERY_UNTIL, a v2 PC always, and its token frames go nowhere', async () => {
+  const clock = handClock();
+  const r = await relay({ now: clock.now, expiryEvery: 10 });
+  try {
+    const old = connect(oldPcUrl(r.base, secrets.one, sign(keyA, claimsFor('user_1')), 'Old'));
+    assert.deepStrictEqual(await old.next(), { brothers: [] });
+    const v2 = connect(pcUrl(r.base, secrets.two));
+    await v2.opened;
+    const phone = connect(`${r.base}/phone?id=${R.pcId(secrets.two)}`);
+    await phone.next();
+    const ch = (await v2.next()).open;
+    // A v2 PC has no token to replace: no answer, and nothing passed on.
+    v2.send(JSON.stringify({ token: sign(keyA, claimsFor('user_1')) }));
+    await pingPong(v2);
+    v2.send(R.frame(ch, Buffer.from('after')));
+    assert.strictEqual((await phone.next()).toString(), 'after');
+
+    clock.t = nowS() * 1000 + 3600_000;
+    await later(60);
+    await pingPong(old);
+    clock.t = R.QUERY_UNTIL + 1;
+    assert.deepStrictEqual(await old.closed, { code: CLOSE_BAD_TOKEN, reason: 'token expired' });
+    await pingPong(v2);
+    v2.close();
+    phone.close();
+  } finally {
+    await r.close();
+  }
+});
+
+test('the state file goes through a fresh temp file, and holds only so many users', async () => {
+  const dir = stateDir();
+  const stateFile = path.join(dir, 'first-seen.json');
+  // Left by a crash, readable by all.
+  fs.writeFileSync(`${stateFile}.tmp`, 'stale', { mode: 0o644 });
+  const r = await relay({ now: ticking(), stateFile, saveAfter: 10, maxUsers: 2 });
+  try {
+    for (const user of ['user_1', 'user_2', 'user_3']) {
+      const pc = connect(pcUrl(r.base, secrets.one, sign(keyA, claimsFor(user)), 'Desk'));
+      await pc.next();
+      pc.close();
+      await pc.closed;
+      await later(50);
+    }
+  } finally {
+    await r.close();
+  }
+  assert.deepStrictEqual(fs.readdirSync(dir), ['first-seen.json']);
+  if (process.platform !== 'win32') assert.strictEqual(fs.statSync(stateFile).mode & 0o777, 0o600);
+  const { seen } = R.seenFromJson(fs.readFileSync(stateFile, 'utf8'));
+  assert.deepStrictEqual([...seen.keys()].sort(), ['user_2', 'user_3']);
+  fs.rmSync(dir, { recursive: true, force: true });
 });

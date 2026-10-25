@@ -29,6 +29,19 @@ const MAX_SEEN_PER_USER = 64;
 // a proxy's access log does not keep them. Every install is offered each
 // release, so two months covers any that is not left switched off.
 const QUERY_UNTIL = Date.parse('2027-01-01T00:00:00Z');
+// How long past its token's exp a signed in socket stays open with no
+// fresh token accepted: room for a refresh sent late, a slow WorkOS and
+// clocks that drift, short enough that a stolen token buys minutes.
+const EXPIRY_GRACE = 120 * 1000;
+// A user not seen this long is forgotten, and past MAX_USERS the ones
+// seen longest ago go first, so the state file cannot grow without end.
+const FORGET_AFTER = 90 * 24 * 60 * 60 * 1000;
+const MAX_USERS = 10000;
+// When a user was last seen is written down at most this often, so a
+// busy user does not cost a write of the state file per connect.
+const LAST_SEEN_STEP = 24 * 60 * 60 * 1000;
+// A text control frame may carry a token, which auth.js takes up to 8 KiB.
+const MAX_CONTROL = 9 * 1024;
 
 // A PC's id is derived from its secret, so the relay needs no storage to
 // know which PC is which, and nobody without the secret can pose as it.
@@ -87,10 +100,10 @@ function brothersOf(pcs, self) {
     .sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
 }
 
-// Text control from a PC: a ping, a join request or a link closed. Anything
-// else is dropped, as before.
+// Text control from a PC: a ping, a join request, a link closed or a fresh
+// token. Anything else is dropped, as before.
 function parseControl(data) {
-  if (!data || data.length > 1024) return null;
+  if (!data || data.length > MAX_CONTROL) return null;
   let m;
   try {
     m = JSON.parse(data.toString());
@@ -101,7 +114,17 @@ function parseControl(data) {
   if (m.ping === 1) return { ping: true };
   if (m.join && typeof m.join === 'object' && isId(m.join.to)) return { join: m.join.to };
   if (Number.isInteger(m.close) && m.close > 0 && m.close < BROADCAST) return { close: m.close };
+  if (typeof m.token === 'string' && m.token) return { token: m.token };
   return null;
+}
+
+// When the relay closes a signed in socket whose token ran out (ms), given
+// its token's exp (s) and whether it said it can refresh in band. One that
+// cannot, as 0.32 and older, is let be until QUERY_UNTIL, the day those are
+// retired anyway; from then on it is held to the same rule.
+function closeAt(exp, refresh) {
+  const at = exp * 1000 + EXPIRY_GRACE;
+  return refresh ? at : Math.max(at, QUERY_UNTIL);
 }
 
 // What proves a PC on /pc: its secret, and when signed in its WorkOS
@@ -175,33 +198,59 @@ function admit(seen, connected, id) {
   return { ok: false, evict: null };
 }
 
-// The first-seen map as the state file keeps it: per WorkOS user, each id
-// with its time and order of recording. Nothing secret: the ids are hashes
-// a phone already knows, the users are WorkOS ids.
-function seenToJson(seen) {
+// The first-seen map as the state file keeps it: per WorkOS user, when it
+// was last seen and each id with its time and order of recording. Nothing
+// secret: the ids are hashes a phone already knows, the users are WorkOS ids.
+function seenToJson(seen, last) {
   const users = {};
   for (const [sub, ids] of seen) {
-    if (ids.size) users[sub] = [...ids].map(([id, v]) => [id, v.at, v.n]);
+    if (ids.size) users[sub] = { last: last.get(sub) || 0, ids: [...ids].map(([id, v]) => [id, v.at, v.n]) };
   }
-  return JSON.stringify({ v: 1, users });
+  return JSON.stringify({ v: 2, users });
 }
 
-// The state file read back, or throws when it is not one. Entries that do
-// not parse are skipped, and a user past MAX_SEEN_PER_USER keeps its oldest.
+// The state file read back as { seen, last }, or throws when it is not one.
+// Entries that do not parse are skipped, and a user past MAX_SEEN_PER_USER
+// keeps its oldest. A v1 file (no last seen) counts its newest id's time.
 function seenFromJson(text) {
   const doc = JSON.parse(text);
-  if (!doc || doc.v !== 1 || typeof doc.users !== 'object' || !doc.users) throw new Error('not a state file');
+  if (!doc || (doc.v !== 1 && doc.v !== 2) || typeof doc.users !== 'object' || !doc.users) throw new Error('not a state file');
   const seen = new Map();
-  for (const [sub, list] of Object.entries(doc.users)) {
+  const last = new Map();
+  for (const [sub, user] of Object.entries(doc.users)) {
+    const list = doc.v === 1 ? user : user && user.ids;
     if (!sub || !Array.isArray(list)) continue;
     const entries = list
       .filter((e) => Array.isArray(e) && isId(e[0]) && Number.isFinite(e[1]) && Number.isInteger(e[2]) && e[2] >= 0)
       .map(([id, at, n]) => [id, { at, n }])
       .sort((a, b) => (older(a[1], b[1]) ? -1 : older(b[1], a[1]) ? 1 : 0))
       .slice(0, MAX_SEEN_PER_USER);
-    if (entries.length) seen.set(sub, new Map(entries));
+    if (!entries.length) continue;
+    seen.set(sub, new Map(entries));
+    const at = doc.v === 2 && Number.isFinite(user.last) ? user.last : 0;
+    last.set(sub, Math.max(at, ...entries.map((e) => e[1].at)));
   }
-  return seen;
+  return { seen, last };
+}
+
+// Forgets the users of seen (and last) not seen for FORGET_AFTER at t, then
+// the ones seen longest ago while there are more than MAX_USERS. Users in
+// keep (connected now) are never forgotten. Gives how many went.
+function pruneSeen(seen, last, t, keep, maxUsers = MAX_USERS) {
+  let gone = 0;
+  const forget = (sub) => {
+    seen.delete(sub);
+    last.delete(sub);
+    gone++;
+  };
+  for (const sub of [...seen.keys()]) {
+    if (!keep.has(sub) && (last.get(sub) || 0) < t - FORGET_AFTER) forget(sub);
+  }
+  if (seen.size > maxUsers) {
+    const oldest = [...seen.keys()].filter((sub) => !keep.has(sub)).sort((a, b) => (last.get(a) || 0) - (last.get(b) || 0));
+    for (const sub of oldest.slice(0, seen.size - maxUsers)) forget(sub);
+  }
+  return gone;
 }
 
 // Whether a frame's payload is past what the relay passes on.
@@ -223,6 +272,12 @@ module.exports = {
   MAX_PCS_PER_USER,
   MAX_PCS_PER_IP,
   MAX_SEEN_PER_USER,
+  EXPIRY_GRACE,
+  FORGET_AFTER,
+  MAX_USERS,
+  LAST_SEEN_STEP,
+  closeAt,
+  pruneSeen,
   firstSeen,
   admit,
   QUERY_UNTIL,

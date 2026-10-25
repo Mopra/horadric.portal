@@ -35,7 +35,9 @@ now, and remembers when it first saw each of a user's PC ids.
 `X-Horadric-Secret: <secret>` and `Authorization: Bearer <WorkOS access
 token>`. What proves a PC is never in the address, where a proxy's access
 log would keep it. Without a token the PC is a v2 PC, served exactly as
-before, and `name` is ignored.
+before, and `name` is ignored. A signed in PC that can hand the relay a
+fresh token on the open socket says so with `X-Horadric-Refresh: 1` (see
+Fresh tokens below).
 
 Horadric 0.32 and older send `/pc?secret=..&token=..&name=..` instead.
 The relay takes that until 2027-01-01 (`QUERY_UNTIL` in `relay.js`), and
@@ -56,8 +58,11 @@ user's real machines, only ones newer than its own. Those times are kept
 across restarts in `first-seen.json` in `STATE_DIR` (default `state/`
 next to `server.js`; ours is `/var/lib/horadric-portal`): only WorkOS
 user ids, PC ids and times, nothing secret. It is written a few seconds
-after a change and at shutdown, by temp file and rename, so a restart no
-longer makes every id new. A missing or unreadable file starts the relay
+after a change and at shutdown, to a fresh temp file (mode 0600, one left
+by a crash removed first) that is flushed to disk, renamed over and the
+directory flushed, so a restart no longer makes every id new. A user not
+seen for 90 days is forgotten, and past 10,000 users the ones seen
+longest ago go first (a connected one never), so the file stays bounded. A missing or unreadable file starts the relay
 empty, with a line in its log; then every id is new and the order of
 reconnecting decides until the cap fills. One address may hold
 32 PCs open, counted from the upgrade on; one more is answered 429. Behind
@@ -70,16 +75,41 @@ fetched again for an unknown key id at most every 10 seconds). It must
 not be expired (5 seconds of slack), its `iss` must be
 `https://api.workos.com/user_management/<client id>`, or one of
 `WORKOS_ISSUER` (comma separated) when set, a `client_id` claim must be
-ours, and `sub` is the user. A refused token closes the socket at once,
-and an accepted one closes it when its `exp` passes, with `4401` and
-`token expired`, so the PC signs in again and reconnects (a v2 PC
-without a token is never closed this way):
+ours, and `sub` is the user. A refused token closes the socket at once:
 
 - `4401` with the reason (`token expired`, `wrong issuer`, `bad signature`,
   ...): sign in again.
 - `4503` (`cannot reach WorkOS`, `sign in is not set up on this relay`,
   or a key id the relay may not have fetched yet): the token may be fine,
   try again later as is.
+
+### Fresh tokens
+
+A WorkOS access token lasts minutes, far less than a PC stays connected,
+so a PC that dialled with `X-Horadric-Refresh: 1` hands the relay a fresh
+one on the open socket before its current one expires (Horadric does it
+about 90 seconds before `exp`), as a text frame:
+
+- PC to relay: `{"token":"<fresh WorkOS access token>"}`.
+- Relay to PC: `{"token":"ok","exp":<exp>}` when it is accepted: checked
+  as at connect, and for the same WorkOS user (`sub`) as the socket. The
+  socket's expiry moves to the new `exp`.
+- `{"token":"refused","why":"<reason>"}`: not accepted (`another user`,
+  `token expired`, `bad signature`, ...). The socket stays, on its old
+  expiry, and may try again before it.
+- `{"token":"later"}`: the token could not be checked now (WorkOS
+  unreachable, a key id not fetched yet), or one is still being checked
+  for this socket. Try again soon.
+
+Such a socket is closed with `4401` and `token expired` once its `exp`
+is more than 120 seconds past with no fresh token accepted, so a token
+taken from a PC holds a socket open minutes, not for as long as it
+likes. A signed in PC that did not send the header (as Horadric
+0.32) is never closed for its token before `QUERY_UNTIL`, 2027-01-01;
+from then on the same rule holds for it. A v2 PC without a token is
+never closed for expiry, and its `{"token":...}` frames are dropped. A
+`{"token":...}` frame is never passed on to a phone or a brother. The
+relay checks expiries in one sweep every 10 seconds.
 
 Relay to a signed in PC, text:
 
@@ -98,6 +128,7 @@ PC to relay, text:
 
 - `{"join":{"to":"<pc id>"}}`: open a channel to that brother.
 - `{"close":<ch>}`: close a brother channel.
+- `{"token":"<access token>"}`: a fresh token, see Fresh tokens.
 
 Binary on a brother channel is framed as for phones (4 bytes big endian
 channel, then the payload) and arrives at the other PC with its own

@@ -44,23 +44,56 @@ const SAVE_AFTER = 5000;
 
 const log = (...a) => console.log(...a);
 
+// How often signed in sockets are checked for a token run out. One sweep
+// over them all rather than a timer each: a check is a comparison, and a
+// refresh then only moves a number.
+const EXPIRY_EVERY = 10000;
+
 // The first-seen map from file, or empty when there is none or it cannot
 // be read: a relay that forgot is weaker, never down.
 function loadSeen(file) {
+  const empty = () => ({ seen: new Map(), last: new Map() });
   let text;
   try {
     text = fs.readFileSync(file, 'utf8');
   } catch (err) {
     log(err.code === 'ENOENT' ? `no state at ${file}, starting empty` : `cannot read ${file} (${err.code || err.message}), starting empty`);
-    return new Map();
+    return empty();
   }
   try {
-    const seen = R.seenFromJson(text);
-    log(`state from ${file}: ${seen.size} users`);
-    return seen;
+    const state = R.seenFromJson(text);
+    log(`state from ${file}: ${state.seen.size} users`);
+    return state;
   } catch (err) {
     log(`cannot parse ${file} (${err.message}), starting empty`);
-    return new Map();
+    return empty();
+  }
+}
+
+// Writes text to file so a crash at any point leaves the old file or the
+// new one whole: a temp file of our own, flushed to disk, renamed over,
+// and the rename itself flushed with the directory.
+function writeDurably(file, text) {
+  const tmp = `${file}.tmp`;
+  // One left by a crash may have been made with a looser mode, which
+  // writing over it would keep.
+  fs.rmSync(tmp, { force: true });
+  const fd = fs.openSync(tmp, 'wx', 0o600);
+  try {
+    fs.writeSync(fd, text);
+    fs.fsyncSync(fd);
+  } finally {
+    fs.closeSync(fd);
+  }
+  fs.renameSync(tmp, file);
+  let dir;
+  try {
+    dir = fs.openSync(path.dirname(file), 'r');
+    fs.fsyncSync(dir);
+  } catch {
+    // Windows cannot open a directory to flush it; the rename stands.
+  } finally {
+    if (dir !== undefined) fs.closeSync(dir);
   }
 }
 
@@ -84,7 +117,12 @@ function createRelay(options = {}) {
   // id new and hand the slots to whoever reconnects first.
   const stateFile = options.stateFile || null;
   const saveAfter = options.saveAfter ?? SAVE_AFTER;
-  const seen = stateFile ? loadSeen(stateFile) : new Map();
+  const { seen, last } = stateFile ? loadSeen(stateFile) : { seen: new Map(), last: new Map() };
+  // WorkOS user -> when the relay last saw it (to LAST_SEEN_STEP), so a
+  // user gone for good is forgotten in time.
+  const maxUsers = options.maxUsers ?? R.MAX_USERS;
+  const expiryEvery = options.expiryEvery ?? EXPIRY_EVERY;
+  R.pruneSeen(seen, last, now(), new Set(), maxUsers);
   let saveTimer = null;
   let dirty = false;
 
@@ -102,13 +140,25 @@ function createRelay(options = {}) {
     saveTimer = null;
     if (!stateFile || !dirty) return;
     dirty = false;
-    const tmp = `${stateFile}.tmp`;
+    R.pruneSeen(seen, last, now(), users, maxUsers);
     try {
-      fs.writeFileSync(tmp, R.seenToJson(seen), { mode: 0o600 });
-      fs.renameSync(tmp, stateFile);
+      writeDurably(stateFile, R.seenToJson(seen, last));
     } catch (err) {
       log(`cannot write ${stateFile}: ${err.message}`);
     }
+  }
+
+  // The user is about now. Written down when it moved a step, and a new
+  // user may push the one seen longest ago out past maxUsers.
+  function sawUser(user) {
+    const t = now();
+    const known = seen.has(user);
+    if (!known) seen.set(user, new Map());
+    if (known && t - (last.get(user) || 0) < R.LAST_SEEN_STEP) return;
+    last.set(user, t);
+    if (!known) R.pruneSeen(seen, last, t, { has: (sub) => sub === user || users.has(sub) }, maxUsers);
+    dirty = true;
+    scheduleSave();
   }
   // Address -> PC sockets open from it, counted from the upgrade on.
   const ips = new Map();
@@ -132,7 +182,7 @@ function createRelay(options = {}) {
   // their place to an id seen before them. Called once the token is
   // accepted, which is when an id is first seen.
   function makeRoomFor(user, id) {
-    if (!seen.has(user)) seen.set(user, new Map());
+    sawUser(user);
     const connected = users.get(user) || new Set();
     if (!seen.get(user).has(id)) {
       R.firstSeen(seen.get(user), id, now(), connected);
@@ -257,7 +307,45 @@ function createRelay(options = {}) {
     return false;
   }
 
-  function onPc(ws, id, user, name, exp) {
+  // A fresh token sent on the open socket. It must be the socket's own
+  // user's, and moves when the socket is closed for its token running out.
+  // One is checked at a time, so a socket cannot queue up verifications.
+  function refresh(ws, r, token) {
+    if (ws.checking) return sendText(ws, { token: 'later' });
+    ws.checking = true;
+    verify(token).then(
+      (claims) => {
+        ws.checking = false;
+        if (r.pc !== ws) return;
+        if (claims.sub !== r.user) return sendText(ws, { token: 'refused', why: 'another user' });
+        ws.exp = claims.exp;
+        sawUser(r.user);
+        sendText(ws, { token: 'ok', exp: claims.exp });
+      },
+      (err) => {
+        ws.checking = false;
+        if (r.pc !== ws) return;
+        if (!(err instanceof AuthError) || err.retry) return sendText(ws, { token: 'later' });
+        sendText(ws, { token: 'refused', why: err.message });
+      },
+    );
+  }
+
+  // Signed in sockets whose token ran out, past the grace, are closed with
+  // 4401 as one presented expired would be refused, so a token taken from a
+  // PC holds a socket open minutes, not for as long as it likes.
+  function sweepExpired() {
+    const t = now();
+    for (const r of [...rooms.values()]) {
+      const ws = r.pc;
+      if (!ws || !r.user || !Number.isFinite(ws.exp)) continue;
+      if (t <= R.closeAt(ws.exp, ws.refresh)) continue;
+      detach(r);
+      ws.close(CLOSE_BAD_TOKEN, 'token expired');
+    }
+  }
+
+  function onPc(ws, id, user, name, auth) {
     const r = room(id);
     // A second connection with the same id is the PC reconnecting. Its
     // brother channels die with the old socket, as phone sessions would.
@@ -274,6 +362,8 @@ function createRelay(options = {}) {
       sendText(ws, { open: ch });
     }
     if (user) {
+      ws.exp = auth.exp;
+      ws.refresh = auth.refresh;
       r.user = user;
       if (!users.has(user)) users.set(user, new Set());
       users.get(user).add(id);
@@ -287,6 +377,9 @@ function createRelay(options = {}) {
         if (r.pc !== ws) return;
         if (m.join) return join(r, m.join);
         if (m.close) return closeLink(r, m.close);
+        // Never passed on, and only a socket that came signed in has a
+        // token to replace.
+        if (m.token && r.user) return refresh(ws, r, m.token);
         return;
       }
       const f = R.unframe(data);
@@ -371,6 +464,7 @@ function createRelay(options = {}) {
           then(ws);
         });
       const name = R.cleanName(url.searchParams.get('name'));
+      const canRefresh = req.headers['x-horadric-refresh'] === '1';
       const id = R.pcId(secret);
       if (token === null) return upgrade((ws) => onPc(ws, id, null, name));
       // The token is checked before the PC takes its room, so a refused
@@ -379,7 +473,7 @@ function createRelay(options = {}) {
         (claims) => {
           if (socket.destroyed) return release();
           if (!makeRoomFor(claims.sub, id)) return upgrade((ws) => ws.close(CLOSE_TOO_MANY, 'too many machines'));
-          upgrade((ws) => onPc(ws, id, claims.sub, name, claims.exp));
+          upgrade((ws) => onPc(ws, id, claims.sub, name, { exp: claims.exp, refresh: canRefresh }));
         },
         (err) => {
           if (socket.destroyed) return release();
@@ -410,9 +504,12 @@ function createRelay(options = {}) {
     }
   }, 30000);
   beat.unref();
+  const expiry = setInterval(sweepExpired, expiryEvery);
+  expiry.unref();
   server.saveState = save;
   server.on('close', () => {
     clearInterval(beat);
+    clearInterval(expiry);
     save();
     for (const ws of wss.clients) ws.terminate();
   });
