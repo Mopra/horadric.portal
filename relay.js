@@ -15,6 +15,11 @@ const MAX_NAME = 64;
 // the second keeps one host from holding the relay's sockets.
 const MAX_PCS_PER_USER = 16;
 const MAX_PCS_PER_IP = 32;
+// Ids of one user whose first-seen time the relay remembers, so the cap
+// above favours the machines it has known longest. Past this the youngest
+// one not connected is forgotten, never the oldest: a burst of made up
+// secrets only pushes out each other and machines newer than them.
+const MAX_SEEN_PER_USER = 64;
 // Until this day /pc also takes the secret and token in its query string,
 // as Horadric 0.32 and older send them; 0.33 sends them in headers, where
 // a proxy's access log does not keep them. Every install is offered each
@@ -125,6 +130,47 @@ function clientIp(headers, remote, trustProxy) {
   return remote || '';
 }
 
+// When the relay first saw id among one user's PCs, recorded now (at t) if
+// it never did. seen maps id -> { at, n }: n is the order of recording, so
+// two ids seen in the same millisecond still have an older and a younger.
+// connected holds ids that must not be forgotten to make room.
+function firstSeen(seen, id, t, connected) {
+  const known = seen.get(id);
+  if (known) return known;
+  if (seen.size >= MAX_SEEN_PER_USER) {
+    let youngest = null;
+    for (const [k, v] of seen) {
+      if (!connected.has(k) && (!youngest || older(youngest[1], v))) youngest = [k, v];
+    }
+    if (youngest) seen.delete(youngest[0]);
+  }
+  let n = 0;
+  for (const v of seen.values()) n = Math.max(n, v.n + 1);
+  const entry = { at: t, n };
+  seen.set(id, entry);
+  return entry;
+}
+
+const older = (a, b) => a.at < b.at || (a.at === b.at && a.n < b.n);
+
+// Whether id may join a user whose connected ids are connected, and which
+// of them gives way. At the cap the oldest first seen win: id takes the
+// place of the youngest connected one when it was seen before it, else it
+// is refused. Gives { ok, evict } with evict an id or null.
+function admit(seen, connected, id) {
+  if (connected.has(id) || connected.size < MAX_PCS_PER_USER) return { ok: true, evict: null };
+  const mine = seen.get(id);
+  let youngest = null;
+  for (const k of connected) {
+    const v = seen.get(k);
+    // An id with no record is younger than any with one.
+    if (!v) return mine ? { ok: true, evict: k } : { ok: false, evict: null };
+    if (!youngest || older(youngest[1], v)) youngest = [k, v];
+  }
+  if (mine && older(mine, youngest[1])) return { ok: true, evict: youngest[0] };
+  return { ok: false, evict: null };
+}
+
 const isId = (s) => typeof s === 'string' && /^[0-9a-f]{32}$/.test(s);
 const isSecret = (s) => typeof s === 'string' && s.length >= 16 && s.length <= 256;
 
@@ -136,6 +182,9 @@ module.exports = {
   MAX_NAME,
   MAX_PCS_PER_USER,
   MAX_PCS_PER_IP,
+  MAX_SEEN_PER_USER,
+  firstSeen,
+  admit,
   QUERY_UNTIL,
   credentials,
   clientIp,

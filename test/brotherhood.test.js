@@ -159,6 +159,7 @@ function connect(url, headers = {}) {
         ok(m);
       });
     });
+  ws.queueLength = () => queue.length;
   ws.closed = new Promise((ok) => ws.on('close', (code, reason) => ok({ code, reason: reason.toString() })));
   ws.opened = new Promise((ok, fail) => {
     ws.on('open', ok);
@@ -392,6 +393,105 @@ test('one user may connect only so many machines, and one address only so many P
     const back = connect(pcUrl(r.base, 'v2-secret-in-its-place'));
     await back.opened;
     open.push(back);
+  } finally {
+    for (const w of open) w.close();
+    await r.close();
+  }
+});
+
+test('the ids the relay remembers per user stay bounded, and the oldest and connected are kept', () => {
+  const seen = new Map();
+  const connected = new Set(['c1', 'c2']);
+  R.firstSeen(seen, 'oldest', 1, connected);
+  R.firstSeen(seen, 'c1', 2, connected);
+  R.firstSeen(seen, 'c2', 3, connected);
+  for (let i = 0; i < 500; i++) R.firstSeen(seen, `burst-${i}`, 10 + i, connected);
+  assert.strictEqual(seen.size, R.MAX_SEEN_PER_USER);
+  for (const id of ['oldest', 'c1', 'c2']) assert.ok(seen.has(id), id);
+  // A known id keeps its first time.
+  assert.strictEqual(R.firstSeen(seen, 'oldest', 9999, connected).at, 1);
+});
+
+test('at the cap the id seen first wins, ties broken by order of recording', () => {
+  const seen = new Map();
+  const connected = new Set();
+  for (let i = 0; i < R.MAX_PCS_PER_USER; i++) {
+    R.firstSeen(seen, `m${i}`, 5, connected);
+    connected.add(`m${i}`);
+  }
+  assert.deepStrictEqual(R.admit(seen, connected, 'm3'), { ok: true, evict: null });
+  R.firstSeen(seen, 'late', 5, connected);
+  assert.deepStrictEqual(R.admit(seen, connected, 'late'), { ok: false, evict: null });
+  const early = new Map([['early', { at: 1, n: 0 }], ...seen]);
+  assert.deepStrictEqual(R.admit(early, connected, 'early'), { ok: true, evict: `m${R.MAX_PCS_PER_USER - 1}` });
+});
+
+// A clock that moves one second per reading, so first-seen order is plain.
+function ticking() {
+  let t = 1_700_000_000_000;
+  return () => (t += 1000);
+}
+
+const pingPong = async (pc) => {
+  pc.send('{"ping":1}');
+  assert.deepStrictEqual(await pc.next(), { pong: 1 });
+};
+
+test('a burst of new secrets on a stolen login never displaces a machine the relay knew before', async () => {
+  const r = await relay({ now: ticking() });
+  const open = [];
+  try {
+    for (let i = 0; i < R.MAX_PCS_PER_USER; i++) {
+      const pc = connect(pcUrl(r.base, `real-machine-secret-${i}`, sign(keyA, claimsFor('user_1')), `M${i}`));
+      await pc.next();
+      open.push(pc);
+    }
+    const real = open.slice();
+    // Rounds, so the burst stays under the cap one address has.
+    for (let round = 0; round < 4; round++) {
+      const attackers = [];
+      for (let i = 0; i < 10; i++) {
+        attackers.push(connect(pcUrl(r.base, crypto.randomBytes(24).toString('hex'), sign(keyA, claimsFor('user_1')), 'Evil')));
+      }
+      for (const a of attackers) assert.deepStrictEqual(await a.closed, { code: CLOSE_TOO_MANY, reason: 'too many machines' });
+    }
+    for (const pc of real) {
+      assert.strictEqual(pc.readyState, WebSocket.OPEN);
+      while (pc.queueLength()) await pc.next();
+      await pingPong(pc);
+    }
+  } finally {
+    for (const w of open) w.close();
+    await r.close();
+  }
+});
+
+test('a machine known before the ones holding the slots gets in, and the youngest gives way', async () => {
+  const r = await relay({ now: ticking() });
+  const open = [];
+  try {
+    const old = connect(pcUrl(r.base, 'old-machine-secret', sign(keyA, claimsFor('user_1')), 'Old'));
+    await old.next();
+    old.close();
+    await old.closed;
+    for (let i = 0; i < R.MAX_PCS_PER_USER; i++) {
+      const pc = connect(pcUrl(r.base, `newer-machine-secret-${i}`, sign(keyA, claimsFor('user_1')), `N${i}`));
+      await pc.next();
+      open.push(pc);
+    }
+    const youngest = open[open.length - 1];
+    const back = connect(pcUrl(r.base, 'old-machine-secret', sign(keyA, claimsFor('user_1')), 'Old'));
+    open.push(back);
+    assert.deepStrictEqual(await youngest.closed, { code: CLOSE_TOO_MANY, reason: 'too many machines' });
+    const { brothers } = await back.next();
+    assert.strictEqual(brothers.length, R.MAX_PCS_PER_USER - 1);
+    assert.ok(!brothers.some((b) => b.id === R.pcId(`newer-machine-secret-${R.MAX_PCS_PER_USER - 1}`)));
+    // The one that gave way is now the newest and stays out.
+    const retry = connect(pcUrl(r.base, `newer-machine-secret-${R.MAX_PCS_PER_USER - 1}`, sign(keyA, claimsFor('user_1')), 'N'));
+    assert.deepStrictEqual(await retry.closed, { code: CLOSE_TOO_MANY, reason: 'too many machines' });
+    // And a machine new to the relay is refused while every slot is older.
+    const fresh = connect(pcUrl(r.base, 'brand-new-machine-secret', sign(keyA, claimsFor('user_1')), 'Fresh'));
+    assert.deepStrictEqual(await fresh.closed, { code: CLOSE_TOO_MANY, reason: 'too many machines' });
   } finally {
     for (const w of open) w.close();
     await r.close();

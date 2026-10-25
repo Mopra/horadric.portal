@@ -51,6 +51,10 @@ function createRelay(options = {}) {
   const rooms = new Map();
   // WorkOS user (sub) -> Set of ids of that user's connected PCs.
   const users = new Map();
+  // WorkOS user (sub) -> Map of id -> when the relay first saw it, at most
+  // R.MAX_SEEN_PER_USER. Only in memory, so after a restart every id is new
+  // again and until the cap fills the order of reconnecting decides.
+  const seen = new Map();
   // Address -> PC sockets open from it, counted from the upgrade on.
   const ips = new Map();
 
@@ -67,10 +71,23 @@ function createRelay(options = {}) {
     else ips.delete(ip);
   }
 
-  // Whether one more PC, id, may join user's: one already there reconnects.
-  function hasRoomFor(user, id) {
-    const ids = users.get(user);
-    return !ids || ids.has(id) || ids.size < R.MAX_PCS_PER_USER;
+  // Whether one more PC, id, may join user's. At the cap the machines the
+  // relay has known longest win, so a stolen login opening sockets with
+  // fresh secrets cannot shut out the user's real ones: those only lose
+  // their place to an id seen before them. Called once the token is
+  // accepted, which is when an id is first seen.
+  function makeRoomFor(user, id) {
+    if (!seen.has(user)) seen.set(user, new Map());
+    const connected = users.get(user) || new Set();
+    R.firstSeen(seen.get(user), id, now(), connected);
+    const { ok, evict } = R.admit(seen.get(user), connected, id);
+    if (evict) {
+      const r = rooms.get(evict);
+      const ws = r.pc;
+      detach(r);
+      ws.close(CLOSE_TOO_MANY, 'too many machines');
+    }
+    return ok;
   }
 
   function serveStatic(req, res) {
@@ -220,14 +237,19 @@ function createRelay(options = {}) {
       if (phone && phone.readyState === 1) phone.send(f.payload);
     });
     ws.on('close', () => {
-      if (r.pc !== ws) return;
-      r.pc = null;
-      closeLinks(r);
-      leaveUser(r);
-      for (const phone of r.phones.values()) sendText(phone, { relay: 'offline' });
-      dropIfEmpty(id);
+      if (r.pc === ws) detach(r);
     });
     ws.on('error', () => {});
+  }
+
+  // A PC gone, or made to give way: its place is free from now, not from
+  // when its socket finishes closing.
+  function detach(r) {
+    r.pc = null;
+    closeLinks(r);
+    leaveUser(r);
+    for (const phone of r.phones.values()) sendText(phone, { relay: 'offline' });
+    dropIfEmpty(r.id);
   }
 
   function onPhone(ws, id) {
@@ -289,7 +311,7 @@ function createRelay(options = {}) {
       verify(token).then(
         (claims) => {
           if (socket.destroyed) return release();
-          if (!hasRoomFor(claims.sub, id)) return upgrade((ws) => ws.close(CLOSE_TOO_MANY, 'too many machines'));
+          if (!makeRoomFor(claims.sub, id)) return upgrade((ws) => ws.close(CLOSE_TOO_MANY, 'too many machines'));
           upgrade((ws) => onPc(ws, id, claims.sub, name));
         },
         (err) => {

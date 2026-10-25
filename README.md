@@ -43,8 +43,17 @@ answered 400. A phone's `/phone?id=<pc id>` carries no secret: the id is
 a hash of it, public as an address is, and the phone's frames are sealed
 with its own key.
 
-One user may have 16 machines connected at once; one more is closed with
-`4429` (`too many machines`) and tries again later. One address may hold
+One user may have 16 machines connected at once. At that cap the machines
+the relay has known longest win: it remembers when it first saw each of a
+user's PC ids (when its token was accepted), in memory only and at most
+64 per user, forgetting the youngest one not connected past that. One
+more PC takes the place of the youngest connected one when the relay saw
+it first, and that one is closed with `4429` (`too many machines`);
+otherwise the newcomer is closed with `4429` and tries again later. So a
+stolen login opening sockets with made up secrets cannot shut out the
+user's real machines, only ones newer than its own. The relay keeps
+nothing on disk, so after it restarts every id is new again, and the
+order of reconnecting decides until the cap fills. One address may hold
 32 PCs open, counted from the upgrade on; one more is answered 429. Behind
 our proxy (`TRUST_PROXY=1`) the address is the one Traefik puts in
 `X-Real-Ip`.
