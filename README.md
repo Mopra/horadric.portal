@@ -88,7 +88,8 @@ ours, and `sub` is the user. A refused token closes the socket at once:
 A WorkOS access token lasts minutes, far less than a PC stays connected,
 so a PC that dialled with `X-Horadric-Refresh: 1` hands the relay a fresh
 one on the open socket before its current one expires (Horadric does it
-about 90 seconds before `exp`), as a text frame:
+45 seconds before `exp`, and keeps its old expiry until `ok` comes), as a
+text frame:
 
 - PC to relay: `{"token":"<fresh WorkOS access token>"}`.
 - Relay to PC: `{"token":"ok","exp":<exp>}` when it is accepted: checked
@@ -101,12 +102,16 @@ about 90 seconds before `exp`), as a text frame:
   unreachable, a key id not fetched yet), or one is still being checked
   for this socket. Try again soon.
 
-Such a socket is closed with `4401` and `token expired` once its `exp`
-is more than 120 seconds past with no fresh token accepted, so a token
-taken from a PC holds a socket open minutes, not for as long as it
-likes. A signed in PC that did not send the header (as Horadric
-0.32) is never closed for its token before `QUERY_UNTIL`, 2027-01-01;
-from then on the same rule holds for it. A v2 PC without a token is
+A signed in socket is closed with `4401` and `token expired` once its
+`exp` is more than 120 seconds past with no fresh token accepted, so a
+token taken from a PC holds a socket open minutes, not for as long as it
+likes. Only a signed in PC that did not send the header and whose id
+the relay first saw before it began asking for refreshes (Horadric 0.34
+and older; the moment is `legacyBefore` in the state file, set on the
+relay's first start with this rule) is never closed for its token before
+`QUERY_UNTIL`, 2027-01-01; from then on the same rule holds for it. A
+new id without the header is held to the rule at once, so leaving the
+header out buys a stolen token nothing. A v2 PC without a token is
 never closed for expiry, and its `{"token":...}` frames are dropped. A
 `{"token":...}` frame is never passed on to a phone or a brother. The
 relay checks expiries in one sweep every 10 seconds.

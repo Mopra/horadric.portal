@@ -136,14 +136,30 @@ test('control messages from a PC are parsed, anything else dropped', () => {
   assert.strictEqual(R.parseControl(Buffer.from(JSON.stringify({ token: 'x'.repeat(10000) }))), null);
 });
 
-test('a socket that can refresh closes at exp plus grace, one that cannot not before QUERY_UNTIL', () => {
+test('a socket closes at exp plus grace, an exempt one not before QUERY_UNTIL', () => {
   const exp = 1_790_000_000;
-  assert.strictEqual(R.closeAt(exp, true), exp * 1000 + R.EXPIRY_GRACE);
+  assert.strictEqual(R.closeAt(exp, false), exp * 1000 + R.EXPIRY_GRACE);
   assert.strictEqual(R.EXPIRY_GRACE, 120_000);
-  assert.strictEqual(R.closeAt(exp, false), R.QUERY_UNTIL);
+  assert.strictEqual(R.closeAt(exp, true), R.QUERY_UNTIL);
   // Past QUERY_UNTIL the same rule holds for both.
   const late = R.QUERY_UNTIL / 1000 + 3600;
-  assert.strictEqual(R.closeAt(late, false), R.closeAt(late, true));
+  assert.strictEqual(R.closeAt(late, true), R.closeAt(late, false));
+});
+
+test('only a machine first seen before the relay asked for refreshes may go without', () => {
+  const cutoff = 1_792_900_000_000;
+  assert.strictEqual(R.exempt(false, cutoff - 1, cutoff), true);
+  // Seen since, or never: leaving the header out buys nothing.
+  assert.strictEqual(R.exempt(false, cutoff, cutoff), false);
+  assert.strictEqual(R.exempt(false, undefined, cutoff), false);
+  // One that refreshes is never exempt.
+  assert.strictEqual(R.exempt(true, cutoff - 1, cutoff), false);
+  assert.strictEqual(R.exempt(false, cutoff - 1, null), false);
+  // The cutoff is kept in the state file.
+  const seen = new Map([['user_1', new Map([['a'.repeat(32), { at: 5, n: 0 }]])]]);
+  const back = R.seenFromJson(R.seenToJson(seen, new Map(), cutoff));
+  assert.strictEqual(back.legacyBefore, cutoff);
+  assert.strictEqual(R.seenFromJson(R.seenToJson(seen, new Map())).legacyBefore, null);
 });
 
 test('users not seen for 90 days are forgotten, and past the cap the ones seen longest ago', () => {
@@ -696,7 +712,9 @@ test('a fresh token on the open socket moves its expiry; refused, foreign and la
   const real = createVerifier({ clientId: CLIENT, fetchJwks: jwksSource([keyA]).fetch });
   let down = false;
   const verify = (t) => (down ? Promise.reject(new AuthError('cannot reach WorkOS', true)) : real(t));
-  const r = await relay({ now: clock.now, verify, expiryEvery: 10 });
+  // The brother below does not refresh: one known from before, so its
+  // own token running out does not close it in the middle of this test.
+  const r = await relay({ now: clock.now, verify, expiryEvery: 10, legacyBefore: clock.t + 3600_000 });
   try {
     const exp = nowS() + 300;
     const pc = connect(refreshingPcUrl(r.base, secrets.one, sign(keyA, claimsFor('user_1', { exp })), 'Desk'));
@@ -746,9 +764,23 @@ test('a fresh token on the open socket moves its expiry; refused, foreign and la
   }
 });
 
-test('a socket that cannot refresh stays until QUERY_UNTIL, a v2 PC always, and its token frames go nowhere', async () => {
+test('a machine new since the cutoff that does not refresh closes at expiry', async () => {
   const clock = handClock();
-  const r = await relay({ now: clock.now, expiryEvery: 10 });
+  const r = await relay({ now: clock.now, expiryEvery: 10, legacyBefore: clock.t - 1000 });
+  try {
+    const exp = nowS() + 300;
+    const pc = connect(pcUrl(r.base, secrets.one, sign(keyA, claimsFor('user_1', { exp })), 'Thief'));
+    assert.deepStrictEqual(await pc.next(), { brothers: [] });
+    clock.t = exp * 1000 + R.EXPIRY_GRACE + 1000;
+    assert.deepStrictEqual(await pc.closed, { code: CLOSE_BAD_TOKEN, reason: 'token expired' });
+  } finally {
+    await r.close();
+  }
+});
+
+test('a socket known from before that cannot refresh stays until QUERY_UNTIL, a v2 PC always, and its token frames go nowhere', async () => {
+  const clock = handClock();
+  const r = await relay({ now: clock.now, expiryEvery: 10, legacyBefore: clock.t + 3600_000 });
   try {
     const old = connect(oldPcUrl(r.base, secrets.one, sign(keyA, claimsFor('user_1')), 'Old'));
     assert.deepStrictEqual(await old.next(), { brothers: [] });

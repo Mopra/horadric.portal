@@ -52,7 +52,7 @@ const EXPIRY_EVERY = 10000;
 // The first-seen map from file, or empty when there is none or it cannot
 // be read: a relay that forgot is weaker, never down.
 function loadSeen(file) {
-  const empty = () => ({ seen: new Map(), last: new Map() });
+  const empty = () => ({ seen: new Map(), last: new Map(), legacyBefore: null });
   let text;
   try {
     text = fs.readFileSync(file, 'utf8');
@@ -117,20 +117,27 @@ function createRelay(options = {}) {
   // id new and hand the slots to whoever reconnects first.
   const stateFile = options.stateFile || null;
   const saveAfter = options.saveAfter ?? SAVE_AFTER;
-  const { seen, last } = stateFile ? loadSeen(stateFile) : { seen: new Map(), last: new Map() };
+  const loaded = stateFile ? loadSeen(stateFile) : { seen: new Map(), last: new Map(), legacyBefore: null };
+  const { seen, last } = loaded;
+  // When this relay began asking machines to refresh their token in band:
+  // only ids it saw before then may go without (R.exempt). Kept in the
+  // state file, so a restart never moves it.
+  const legacyBefore = loaded.legacyBefore ?? options.legacyBefore ?? now();
   // WorkOS user -> when the relay last saw it (to LAST_SEEN_STEP), so a
   // user gone for good is forgotten in time.
   const maxUsers = options.maxUsers ?? R.MAX_USERS;
   const expiryEvery = options.expiryEvery ?? EXPIRY_EVERY;
   R.pruneSeen(seen, last, now(), new Set(), maxUsers);
   let saveTimer = null;
-  let dirty = false;
+  // A cutoff new to the file is written down at once.
+  let dirty = loaded.legacyBefore === null;
 
   function scheduleSave() {
     if (!stateFile || saveTimer) return;
     saveTimer = setTimeout(save, saveAfter);
     saveTimer.unref();
   }
+  if (dirty) scheduleSave();
 
   // Written to a temp file and renamed over, so a crash mid write leaves the
   // old file whole. Synchronous: the file is small, and two writes in flight
@@ -142,7 +149,7 @@ function createRelay(options = {}) {
     dirty = false;
     R.pruneSeen(seen, last, now(), users, maxUsers);
     try {
-      writeDurably(stateFile, R.seenToJson(seen, last));
+      writeDurably(stateFile, R.seenToJson(seen, last, legacyBefore));
     } catch (err) {
       log(`cannot write ${stateFile}: ${err.message}`);
     }
@@ -339,7 +346,7 @@ function createRelay(options = {}) {
     for (const r of [...rooms.values()]) {
       const ws = r.pc;
       if (!ws || !r.user || !Number.isFinite(ws.exp)) continue;
-      if (t <= R.closeAt(ws.exp, ws.refresh)) continue;
+      if (t <= R.closeAt(ws.exp, ws.exempt)) continue;
       detach(r);
       ws.close(CLOSE_BAD_TOKEN, 'token expired');
     }
@@ -363,7 +370,7 @@ function createRelay(options = {}) {
     }
     if (user) {
       ws.exp = auth.exp;
-      ws.refresh = auth.refresh;
+      ws.exempt = auth.exempt;
       r.user = user;
       if (!users.has(user)) users.set(user, new Set());
       users.get(user).add(id);
@@ -473,7 +480,9 @@ function createRelay(options = {}) {
         (claims) => {
           if (socket.destroyed) return release();
           if (!makeRoomFor(claims.sub, id)) return upgrade((ws) => ws.close(CLOSE_TOO_MANY, 'too many machines'));
-          upgrade((ws) => onPc(ws, id, claims.sub, name, { exp: claims.exp, refresh: canRefresh }));
+          const first = seen.get(claims.sub)?.get(id);
+          const isExempt = R.exempt(canRefresh, first?.at, legacyBefore);
+          upgrade((ws) => onPc(ws, id, claims.sub, name, { exp: claims.exp, exempt: isExempt }));
         },
         (err) => {
           if (socket.destroyed) return release();

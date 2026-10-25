@@ -119,12 +119,20 @@ function parseControl(data) {
 }
 
 // When the relay closes a signed in socket whose token ran out (ms), given
-// its token's exp (s) and whether it said it can refresh in band. One that
-// cannot, as 0.32 and older, is let be until QUERY_UNTIL, the day those are
-// retired anyway; from then on it is held to the same rule.
-function closeAt(exp, refresh) {
+// its token's exp (s) and whether it is exempt (see exempt below): one that
+// is, a 0.34 or older machine, is let be until QUERY_UNTIL, the day those
+// are retired anyway; from then on it is held to the same rule.
+function closeAt(exp, isExempt) {
   const at = exp * 1000 + EXPIRY_GRACE;
-  return refresh ? at : Math.max(at, QUERY_UNTIL);
+  return isExempt ? Math.max(at, QUERY_UNTIL) : at;
+}
+
+// Whether a socket may keep its token past expiry: it did not say it
+// refreshes in band, and the relay first saw its id (firstAt, ms) before it
+// began asking for refreshes (legacyBefore, ms). Leaving the header out is
+// not enough, or a stolen token would hold any new socket until QUERY_UNTIL.
+function exempt(canRefresh, firstAt, legacyBefore) {
+  return !canRefresh && Number.isFinite(firstAt) && Number.isFinite(legacyBefore) && firstAt < legacyBefore;
 }
 
 // What proves a PC on /pc: its secret, and when signed in its WorkOS
@@ -201,12 +209,14 @@ function admit(seen, connected, id) {
 // The first-seen map as the state file keeps it: per WorkOS user, when it
 // was last seen and each id with its time and order of recording. Nothing
 // secret: the ids are hashes a phone already knows, the users are WorkOS ids.
-function seenToJson(seen, last) {
+function seenToJson(seen, last, legacyBefore = null) {
   const users = {};
   for (const [sub, ids] of seen) {
     if (ids.size) users[sub] = { last: last.get(sub) || 0, ids: [...ids].map(([id, v]) => [id, v.at, v.n]) };
   }
-  return JSON.stringify({ v: 2, users });
+  const doc = { v: 2, users };
+  if (Number.isFinite(legacyBefore)) doc.legacyBefore = legacyBefore;
+  return JSON.stringify(doc);
 }
 
 // The state file read back as { seen, last }, or throws when it is not one.
@@ -230,7 +240,8 @@ function seenFromJson(text) {
     const at = doc.v === 2 && Number.isFinite(user.last) ? user.last : 0;
     last.set(sub, Math.max(at, ...entries.map((e) => e[1].at)));
   }
-  return { seen, last };
+  const legacyBefore = Number.isFinite(doc.legacyBefore) ? doc.legacyBefore : null;
+  return { seen, last, legacyBefore };
 }
 
 // Forgets the users of seen (and last) not seen for FORGET_AFTER at t, then
@@ -277,6 +288,7 @@ module.exports = {
   MAX_USERS,
   LAST_SEEN_STEP,
   closeAt,
+  exempt,
   pruneSeen,
   firstSeen,
   admit,
