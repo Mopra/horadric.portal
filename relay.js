@@ -9,6 +9,17 @@ const MAX_PHONES = 8;
 // up on another.
 const MAX_LINKS = 16;
 const MAX_NAME = 64;
+// Machines one user may have connected at once, and PCs one address may
+// hold open. Each signed in PC is told of every other on each connect, so
+// the first keeps that from growing with the square of a user's secrets;
+// the second keeps one host from holding the relay's sockets.
+const MAX_PCS_PER_USER = 16;
+const MAX_PCS_PER_IP = 32;
+// Until this day /pc also takes the secret and token in its query string,
+// as Horadric 0.32 and older send them; 0.33 sends them in headers, where
+// a proxy's access log does not keep them. Every install is offered each
+// release, so two months covers any that is not left switched off.
+const QUERY_UNTIL = Date.parse('2027-01-01T00:00:00Z');
 
 // A PC's id is derived from its secret, so the relay needs no storage to
 // know which PC is which, and nobody without the secret can pose as it.
@@ -84,6 +95,36 @@ function parseControl(data) {
   return null;
 }
 
+// What proves a PC on /pc: its secret, and when signed in its WorkOS
+// access token. From headers (X-Horadric-Secret, Authorization: Bearer),
+// or, before QUERY_UNTIL and only when no secret header came, from the
+// query string. Gives { secret, token, query } with null for what is not
+// there; query says the old way was used.
+function credentials(headers, searchParams, now = Date.now()) {
+  const secret = headers['x-horadric-secret'];
+  if (typeof secret === 'string') {
+    const auth = headers.authorization;
+    const bearer = typeof auth === 'string' ? /^Bearer ([^\s]+)$/.exec(auth) : null;
+    return { secret, token: bearer ? bearer[1] : null, query: false };
+  }
+  if (now < QUERY_UNTIL) {
+    return { secret: searchParams.get('secret'), token: searchParams.get('token'), query: true };
+  }
+  return { secret: null, token: null, query: false };
+}
+
+// The address a connection comes from: behind our proxy (trustProxy) the
+// one it says in X-Real-Ip, else the socket's own.
+function clientIp(headers, remote, trustProxy) {
+  if (trustProxy) {
+    const real = headers['x-real-ip'];
+    if (typeof real === 'string' && real) return real.trim();
+    const fwd = headers['x-forwarded-for'];
+    if (typeof fwd === 'string' && fwd) return fwd.split(',').pop().trim();
+  }
+  return remote || '';
+}
+
 const isId = (s) => typeof s === 'string' && /^[0-9a-f]{32}$/.test(s);
 const isSecret = (s) => typeof s === 'string' && s.length >= 16 && s.length <= 256;
 
@@ -93,6 +134,11 @@ module.exports = {
   MAX_PHONES,
   MAX_LINKS,
   MAX_NAME,
+  MAX_PCS_PER_USER,
+  MAX_PCS_PER_IP,
+  QUERY_UNTIL,
+  credentials,
+  clientIp,
   pcId,
   frame,
   unframe,

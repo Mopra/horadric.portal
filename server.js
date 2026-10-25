@@ -27,6 +27,8 @@ const TYPES = {
 // 4503: the token could not be checked now, so try again later as is.
 const CLOSE_BAD_TOKEN = 4401;
 const CLOSE_AUTH_DOWN = 4503;
+// The user has as many machines connected as the relay serves one.
+const CLOSE_TOO_MANY = 4429;
 
 const sendText = (ws, obj) => ws && ws.readyState === 1 && ws.send(JSON.stringify(obj));
 
@@ -37,6 +39,8 @@ function reject(socket, code) {
 
 // options.verify(token) resolves to the token's claims; tests pass their own.
 function createRelay(options = {}) {
+  const trustProxy = options.trustProxy ?? process.env.TRUST_PROXY === '1';
+  const now = options.now || Date.now;
   const verify =
     options.verify ||
     createVerifiers((process.env.WORKOS_CLIENT_ID || '').split(',').filter(Boolean), {
@@ -47,6 +51,27 @@ function createRelay(options = {}) {
   const rooms = new Map();
   // WorkOS user (sub) -> Set of ids of that user's connected PCs.
   const users = new Map();
+  // Address -> PC sockets open from it, counted from the upgrade on.
+  const ips = new Map();
+
+  function holdIp(ip) {
+    const n = ips.get(ip) || 0;
+    if (n >= R.MAX_PCS_PER_IP) return false;
+    ips.set(ip, n + 1);
+    return true;
+  }
+
+  function releaseIp(ip) {
+    const n = (ips.get(ip) || 1) - 1;
+    if (n > 0) ips.set(ip, n);
+    else ips.delete(ip);
+  }
+
+  // Whether one more PC, id, may join user's: one already there reconnects.
+  function hasRoomFor(user, id) {
+    const ids = users.get(user);
+    return !ids || ids.has(id) || ids.size < R.MAX_PCS_PER_USER;
+  }
 
   function serveStatic(req, res) {
     const url = new URL(req.url, 'http://x');
@@ -239,25 +264,39 @@ function createRelay(options = {}) {
   server.on('upgrade', (req, socket, head) => {
     const url = new URL(req.url, 'http://x');
     if (url.pathname === '/pc') {
-      const secret = url.searchParams.get('secret');
+      const { secret, token } = R.credentials(req.headers, url.searchParams, now());
       if (!R.isSecret(secret)) return reject(socket, 400);
+      const ip = R.clientIp(req.headers, req.socket.remoteAddress, trustProxy);
+      if (!holdIp(ip)) return reject(socket, 429);
+      // Held from here, so a token being checked counts too; given back
+      // when the socket closes, or now when it never becomes one.
+      let held = true;
+      const release = () => {
+        if (held) releaseIp(ip);
+        held = false;
+      };
+      socket.once('close', release);
+      const upgrade = (then) =>
+        wss.handleUpgrade(req, socket, head, (ws) => {
+          ws.once('close', release);
+          then(ws);
+        });
       const name = R.cleanName(url.searchParams.get('name'));
-      const token = url.searchParams.get('token');
-      if (token === null) {
-        return wss.handleUpgrade(req, socket, head, (ws) => onPc(ws, R.pcId(secret), null, name));
-      }
+      const id = R.pcId(secret);
+      if (token === null) return upgrade((ws) => onPc(ws, id, null, name));
       // The token is checked before the PC takes its room, so a refused
       // one never replaces the PC already connected with that secret.
       verify(token).then(
         (claims) => {
-          if (socket.destroyed) return;
-          wss.handleUpgrade(req, socket, head, (ws) => onPc(ws, R.pcId(secret), claims.sub, name));
+          if (socket.destroyed) return release();
+          if (!hasRoomFor(claims.sub, id)) return upgrade((ws) => ws.close(CLOSE_TOO_MANY, 'too many machines'));
+          upgrade((ws) => onPc(ws, id, claims.sub, name));
         },
         (err) => {
-          if (socket.destroyed) return;
+          if (socket.destroyed) return release();
           const retry = err instanceof AuthError ? err.retry : true;
           const reason = err instanceof AuthError ? err.message : 'cannot check token';
-          wss.handleUpgrade(req, socket, head, (ws) => ws.close(retry ? CLOSE_AUTH_DOWN : CLOSE_BAD_TOKEN, reason));
+          upgrade((ws) => ws.close(retry ? CLOSE_AUTH_DOWN : CLOSE_BAD_TOKEN, reason));
         },
       );
     } else if (url.pathname === '/phone') {
@@ -290,7 +329,7 @@ function createRelay(options = {}) {
   return server;
 }
 
-module.exports = { createRelay, CLOSE_BAD_TOKEN, CLOSE_AUTH_DOWN };
+module.exports = { createRelay, CLOSE_BAD_TOKEN, CLOSE_AUTH_DOWN, CLOSE_TOO_MANY };
 
 if (require.main === module) {
   const PORT = Number(process.env.PORT) || 43200;

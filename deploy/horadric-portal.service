@@ -10,6 +10,8 @@ WorkingDirectory=/opt/horadric-portal
 # and it is not reachable from the internet.
 Environment=HOST=10.0.0.1
 Environment=PORT=43200
+# Only Traefik reaches it, so the client's address is the X-Real-Ip it sets.
+Environment=TRUST_PROXY=1
 # The WorkOS client whose access tokens sign in a PC (staging for now).
 Environment=WORKOS_CLIENT_ID=client_01M5NBZGRP0NVJ69V5TP9S6PH3,client_01M5NBZGDSBPJMPR5BSJQ9ASEA
 ExecStart=/usr/bin/node server.js

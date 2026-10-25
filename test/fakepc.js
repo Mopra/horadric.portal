@@ -164,7 +164,7 @@ const questsMessage = () => ({ t: 'quests', list: logs });
 
 let ws;
 function start() {
-  ws = new WebSocket(`${relay}/pc?secret=${encodeURIComponent(secret)}`);
+  ws = new WebSocket(`${relay}/pc`, { headers: { 'X-Horadric-Secret': secret } });
   ws.on('open', () => console.log('connected as', id));
   ws.on('message', (data, isBinary) => {
     if (!isBinary) {

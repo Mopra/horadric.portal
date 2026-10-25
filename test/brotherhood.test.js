@@ -5,7 +5,7 @@ const crypto = require('crypto');
 const WebSocket = require('ws');
 const R = require('../relay');
 const { createVerifier, createVerifiers, AuthError, jwksUrl } = require('../auth');
-const { createRelay, CLOSE_BAD_TOKEN, CLOSE_AUTH_DOWN } = require('../server');
+const { createRelay, CLOSE_BAD_TOKEN, CLOSE_AUTH_DOWN, CLOSE_TOO_MANY } = require('../server');
 
 const CLIENT = 'client_test';
 const ISS = `https://api.workos.com/user_management/${CLIENT}`;
@@ -129,17 +129,19 @@ test('control messages from a PC are parsed, anything else dropped', () => {
 
 // The sockets, against a relay on a free port with a local JWKS.
 
-async function relay() {
+async function relay(options = {}) {
   const src = jwksSource([keyA]);
-  const server = createRelay({ verify: createVerifier({ clientId: CLIENT, fetchJwks: src.fetch }) });
+  const server = createRelay({ verify: createVerifier({ clientId: CLIENT, fetchJwks: src.fetch }), ...options });
   await new Promise((ok) => server.listen(0, '127.0.0.1', ok));
   const base = `ws://127.0.0.1:${server.address().port}`;
   return { base, close: () => new Promise((ok) => server.close(ok)) };
 }
 
 // A client that queues what it receives, so a test can wait for the next one.
-function connect(url) {
-  const ws = new WebSocket(url);
+function connect(url, headers = {}) {
+  // A PC's dial is its address and its headers; a phone's is an address.
+  if (typeof url === 'object') ({ url, headers } = url);
+  const ws = new WebSocket(url, { headers });
   const queue = [];
   const waiting = [];
   ws.on('message', (data, isBinary) => {
@@ -165,7 +167,14 @@ function connect(url) {
   return ws;
 }
 
-const pcUrl = (base, secret, token, name) =>
+// How Horadric 0.33 and on dial /pc: the secret and token in headers.
+const pcUrl = (base, secret, token, name) => ({
+  url: `${base}/pc` + (name ? `?name=${encodeURIComponent(name)}` : ''),
+  headers: { 'X-Horadric-Secret': secret, ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+});
+
+// How 0.32 and older dial it, all in the query string.
+const oldPcUrl = (base, secret, token, name) =>
   `${base}/pc?secret=${secret}` + (token ? `&token=${token}` : '') + (name ? `&name=${encodeURIComponent(name)}` : '');
 
 const secrets = { one: 's'.repeat(20) + '1', two: 's'.repeat(20) + '2', three: 's'.repeat(20) + '3' };
@@ -299,4 +308,92 @@ test('two clients: each token is checked against its own client', async () => {
   await assert.rejects(verify(sign(keyA, claimsFor('x', { client_id: 'client_other' }))), /wrong client/);
   // A token naming one client but issued for the other is refused.
   await assert.rejects(verify(sign(keyA, claimsFor('y', { client_id: 'client_prod' }))), /wrong issuer/);
+});
+
+test('credentials come from headers, and from the query only until it is retired', () => {
+  const q = new URLSearchParams('secret=qs&token=qt');
+  const before = R.QUERY_UNTIL - 1;
+  assert.deepStrictEqual(R.credentials({ 'x-horadric-secret': 'hs', authorization: 'Bearer ht' }, q, before), {
+    secret: 'hs',
+    token: 'ht',
+    query: false,
+  });
+  // A header secret wins outright: the query is not read beside it.
+  assert.deepStrictEqual(R.credentials({ 'x-horadric-secret': 'hs' }, q, before), { secret: 'hs', token: null, query: false });
+  assert.strictEqual(R.credentials({ 'x-horadric-secret': 'hs', authorization: 'Basic x' }, q, before).token, null);
+  assert.strictEqual(R.credentials({ 'x-horadric-secret': 'hs', authorization: 'Bearer a b' }, q, before).token, null);
+  assert.deepStrictEqual(R.credentials({}, q, before), { secret: 'qs', token: 'qt', query: true });
+  assert.deepStrictEqual(R.credentials({}, q, R.QUERY_UNTIL), { secret: null, token: null, query: false });
+  assert.ok(R.QUERY_UNTIL > Date.parse('2026-12-01'));
+});
+
+test('the address is the one of the socket unless the proxy in front is trusted', () => {
+  const h = { 'x-real-ip': '203.0.113.9', 'x-forwarded-for': '1.1.1.1, 198.51.100.7' };
+  assert.strictEqual(R.clientIp(h, '10.0.0.2', false), '10.0.0.2');
+  assert.strictEqual(R.clientIp(h, '10.0.0.2', true), '203.0.113.9');
+  assert.strictEqual(R.clientIp({ 'x-forwarded-for': '1.1.1.1, 198.51.100.7' }, '10.0.0.2', true), '198.51.100.7');
+  assert.strictEqual(R.clientIp({}, '10.0.0.2', true), '10.0.0.2');
+});
+
+test('a PC of 0.32 or older still connects by its query string, until the day it is retired', async () => {
+  let r = await relay();
+  try {
+    const old = connect(oldPcUrl(r.base, secrets.one, sign(keyA, claimsFor('user_1')), 'Old'));
+    assert.deepStrictEqual(await old.next(), { brothers: [] });
+    const now = connect(pcUrl(r.base, secrets.two, sign(keyA, claimsFor('user_1')), 'New'));
+    assert.deepStrictEqual(await now.next(), { brothers: [{ id: R.pcId(secrets.one), name: 'Old' }] });
+    old.close();
+    now.close();
+  } finally {
+    await r.close();
+  }
+  r = await relay({ now: () => R.QUERY_UNTIL });
+  try {
+    const old = connect(oldPcUrl(r.base, secrets.one, sign(keyA, claimsFor('user_1')), 'Old'));
+    await assert.rejects(old.opened, /400/);
+    const now = connect(pcUrl(r.base, secrets.two, sign(keyA, claimsFor('user_1')), 'New'));
+    assert.deepStrictEqual(await now.next(), { brothers: [] });
+    now.close();
+  } finally {
+    await r.close();
+  }
+});
+
+test('one user may connect only so many machines, and one address only so many PCs', async () => {
+  const r = await relay();
+  const open = [];
+  try {
+    for (let i = 0; i < R.MAX_PCS_PER_USER; i++) {
+      const pc = connect(pcUrl(r.base, `user-machine-secret-${i}`, sign(keyA, claimsFor('user_1')), `M${i}`));
+      await pc.next();
+      open.push(pc);
+    }
+    const over = connect(pcUrl(r.base, 'user-machine-secret-over', sign(keyA, claimsFor('user_1')), 'Over'));
+    assert.deepStrictEqual(await over.closed, { code: CLOSE_TOO_MANY, reason: 'too many machines' });
+    // One already there reconnects, and another user is not held back.
+    const again = connect(pcUrl(r.base, 'user-machine-secret-0', sign(keyA, claimsFor('user_1')), 'M0'));
+    assert.strictEqual((await again.next()).brothers.length, R.MAX_PCS_PER_USER - 1);
+    open.push(again);
+    const other = connect(pcUrl(r.base, secrets.three, sign(keyA, claimsFor('user_2')), 'Theirs'));
+    assert.deepStrictEqual(await other.next(), { brothers: [] });
+    open.push(other);
+    // Every PC so far came from 127.0.0.1: the rest of its share.
+    while (open.filter((w) => w.readyState === WebSocket.OPEN).length < R.MAX_PCS_PER_IP) {
+      const pc = connect(pcUrl(r.base, `v2-secret-${open.length}-padding`));
+      await pc.opened;
+      open.push(pc);
+    }
+    const refused = connect(pcUrl(r.base, 'v2-secret-one-too-many'));
+    await assert.rejects(refused.opened, /429/);
+    // A PC that goes gives its place back.
+    const gone = open.pop();
+    gone.close();
+    await gone.closed;
+    const back = connect(pcUrl(r.base, 'v2-secret-in-its-place'));
+    await back.opened;
+    open.push(back);
+  } finally {
+    for (const w of open) w.close();
+    await r.close();
+  }
 });

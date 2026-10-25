@@ -30,9 +30,24 @@ The relay checks the WorkOS access token and routes; the approval and
 the keys are end to end between the two PCs. It knows only who is
 connected now and keeps nothing on disk.
 
-`/pc?secret=<secret>&token=<WorkOS access token>&name=<PC name, URI encoded>`.
-Without `token` the PC is a v2 PC, served exactly as before, and
-`name` is ignored.
+`/pc?name=<PC name, URI encoded>`, with the request headers
+`X-Horadric-Secret: <secret>` and `Authorization: Bearer <WorkOS access
+token>`. What proves a PC is never in the address, where a proxy's access
+log would keep it. Without a token the PC is a v2 PC, served exactly as
+before, and `name` is ignored.
+
+Horadric 0.32 and older send `/pc?secret=..&token=..&name=..` instead.
+The relay takes that until 2027-01-01 (`QUERY_UNTIL` in `relay.js`), and
+only when no `X-Horadric-Secret` header came; after it, such a PC is
+answered 400. A phone's `/phone?id=<pc id>` carries no secret: the id is
+a hash of it, public as an address is, and the phone's frames are sealed
+with its own key.
+
+One user may have 16 machines connected at once; one more is closed with
+`4429` (`too many machines`) and tries again later. One address may hold
+32 PCs open, counted from the upgrade on; one more is answered 429. Behind
+our proxy (`TRUST_PROXY=1`) the address is the one Traefik puts in
+`X-Real-Ip`.
 
 The token is an RS256 JWT, checked with Node's own `crypto` against the
 keys at `https://api.workos.com/sso/jwks/<client id>` (`WORKOS_CLIENT_ID` may list several, comma separated: production for installs, staging for dev instances; the token's `client_id` picks one) (cached, and
