@@ -4,6 +4,10 @@ const crypto = require('crypto');
 
 const BROADCAST = 0xffffffff;
 const MAX_FRAME = 1024 * 1024;
+// What a socket may send in one message before ws closes it. Above
+// MAX_FRAME a frame is only dropped, so one too large roster does not
+// close a machine's link in a loop; this bounds the memory one costs.
+const HARD_FRAME = 4 * 1024 * 1024;
 const MAX_PHONES = 8;
 // Brother channels a PC may hold open at once, so one PC cannot pile them
 // up on another.
@@ -171,12 +175,48 @@ function admit(seen, connected, id) {
   return { ok: false, evict: null };
 }
 
+// The first-seen map as the state file keeps it: per WorkOS user, each id
+// with its time and order of recording. Nothing secret: the ids are hashes
+// a phone already knows, the users are WorkOS ids.
+function seenToJson(seen) {
+  const users = {};
+  for (const [sub, ids] of seen) {
+    if (ids.size) users[sub] = [...ids].map(([id, v]) => [id, v.at, v.n]);
+  }
+  return JSON.stringify({ v: 1, users });
+}
+
+// The state file read back, or throws when it is not one. Entries that do
+// not parse are skipped, and a user past MAX_SEEN_PER_USER keeps its oldest.
+function seenFromJson(text) {
+  const doc = JSON.parse(text);
+  if (!doc || doc.v !== 1 || typeof doc.users !== 'object' || !doc.users) throw new Error('not a state file');
+  const seen = new Map();
+  for (const [sub, list] of Object.entries(doc.users)) {
+    if (!sub || !Array.isArray(list)) continue;
+    const entries = list
+      .filter((e) => Array.isArray(e) && isId(e[0]) && Number.isFinite(e[1]) && Number.isInteger(e[2]) && e[2] >= 0)
+      .map(([id, at, n]) => [id, { at, n }])
+      .sort((a, b) => (older(a[1], b[1]) ? -1 : older(b[1], a[1]) ? 1 : 0))
+      .slice(0, MAX_SEEN_PER_USER);
+    if (entries.length) seen.set(sub, new Map(entries));
+  }
+  return seen;
+}
+
+// Whether a frame's payload is past what the relay passes on.
+const tooBig = (payload) => payload.length > MAX_FRAME;
+
 const isId = (s) => typeof s === 'string' && /^[0-9a-f]{32}$/.test(s);
 const isSecret = (s) => typeof s === 'string' && s.length >= 16 && s.length <= 256;
 
 module.exports = {
   BROADCAST,
   MAX_FRAME,
+  HARD_FRAME,
+  tooBig,
+  seenToJson,
+  seenFromJson,
   MAX_PHONES,
   MAX_LINKS,
   MAX_NAME,

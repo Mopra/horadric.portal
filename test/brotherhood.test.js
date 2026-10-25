@@ -2,6 +2,9 @@
 const test = require('node:test');
 const assert = require('node:assert');
 const crypto = require('crypto');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
 const WebSocket = require('ws');
 const R = require('../relay');
 const { createVerifier, createVerifiers, AuthError, jwksUrl } = require('../auth');
@@ -494,6 +497,147 @@ test('a machine known before the ones holding the slots gets in, and the younges
     assert.deepStrictEqual(await fresh.closed, { code: CLOSE_TOO_MANY, reason: 'too many machines' });
   } finally {
     for (const w of open) w.close();
+    await r.close();
+  }
+});
+
+// A fresh directory for one test's state file.
+const stateDir = () => fs.mkdtempSync(path.join(os.tmpdir(), 'portal-state-'));
+
+const until = async (cond) => {
+  for (let i = 0; i < 200 && !cond(); i++) await new Promise((ok) => setTimeout(ok, 10));
+  assert.ok(cond(), 'never happened');
+};
+
+test('the first-seen map survives its file, and a broken entry or an overfull user does not', () => {
+  const a = 'a'.repeat(32);
+  const b = 'b'.repeat(32);
+  const seen = new Map([['user_1', new Map([[a, { at: 5, n: 0 }], [b, { at: 7, n: 1 }]])], ['user_2', new Map()]]);
+  const back = R.seenFromJson(R.seenToJson(seen));
+  assert.deepStrictEqual([...back.keys()], ['user_1']);
+  assert.deepStrictEqual(back.get('user_1'), seen.get('user_1'));
+  const many = Array.from({ length: 100 }, (_, i) => [i.toString(16).padStart(32, '0'), 1000 - i, i]);
+  const doc = { v: 1, users: { u: [...many, ['nope', 1, 0], [a, 'x', 0]], v: 'not a list' } };
+  const got = R.seenFromJson(JSON.stringify(doc)).get('u');
+  assert.strictEqual(got.size, R.MAX_SEEN_PER_USER);
+  // The oldest are the ones kept.
+  assert.ok(got.has(many[99][0]) && !got.has(many[0][0]));
+  assert.throws(() => R.seenFromJson('{"v":2}'));
+  assert.throws(() => R.seenFromJson('not json'));
+  assert.ok(!R.tooBig(Buffer.alloc(R.MAX_FRAME)) && R.tooBig(Buffer.alloc(R.MAX_FRAME + 1)));
+});
+
+test('after a restart a machine known before still beats a burst of new secrets', async () => {
+  const dir = stateDir();
+  const stateFile = path.join(dir, 'first-seen.json');
+  const clock = ticking();
+  let r = await relay({ now: clock, stateFile, saveAfter: 20 });
+  const open = [];
+  try {
+    const old = connect(pcUrl(r.base, 'old-machine-secret', sign(keyA, claimsFor('user_1')), 'Old'));
+    await old.next();
+    // Written once the burst settles, by temp file and rename.
+    await until(() => fs.existsSync(stateFile));
+    assert.deepStrictEqual(fs.readdirSync(dir), ['first-seen.json']);
+    old.close();
+    await old.closed;
+  } finally {
+    await r.close();
+  }
+  r = await relay({ now: clock, stateFile, saveAfter: 20 });
+  try {
+    for (let i = 0; i < R.MAX_PCS_PER_USER; i++) {
+      const pc = connect(pcUrl(r.base, crypto.randomBytes(24).toString('hex'), sign(keyA, claimsFor('user_1')), 'Evil'));
+      await pc.next();
+      open.push(pc);
+    }
+    const back = connect(pcUrl(r.base, 'old-machine-secret', sign(keyA, claimsFor('user_1')), 'Old'));
+    open.push(back);
+    assert.deepStrictEqual(await open[R.MAX_PCS_PER_USER - 1].closed, { code: CLOSE_TOO_MANY, reason: 'too many machines' });
+    assert.strictEqual((await back.next()).brothers.length, R.MAX_PCS_PER_USER - 1);
+  } finally {
+    for (const w of open) w.close();
+    await r.close();
+  }
+  // Closing wrote what the second run learnt, at once.
+  assert.strictEqual(R.seenFromJson(fs.readFileSync(stateFile, 'utf8')).get('user_1').size, R.MAX_PCS_PER_USER + 1);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('a missing or broken state file starts the relay empty', async () => {
+  const dir = stateDir();
+  const broken = path.join(dir, 'broken.json');
+  fs.writeFileSync(broken, '{ half a file');
+  for (const stateFile of [path.join(dir, 'missing.json'), broken, dir]) {
+    const r = await relay({ stateFile });
+    try {
+      const pc = connect(pcUrl(r.base, secrets.one, sign(keyA, claimsFor('user_1')), 'Desk'));
+      assert.deepStrictEqual(await pc.next(), { brothers: [] });
+      pc.close();
+    } finally {
+      await r.close();
+    }
+  }
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('a signed in PC is closed with 4401 when its token expires, a v2 PC stays', async () => {
+  // The relay's clock is just short of the token's expiry.
+  const r = await relay({ now: () => Date.now() + 299_000 });
+  try {
+    const v2 = connect(pcUrl(r.base, secrets.two));
+    await v2.opened;
+    const one = connect(pcUrl(r.base, secrets.one, sign(keyA, claimsFor('user_1', { exp: nowS() + 300 })), 'Desk'));
+    assert.deepStrictEqual(await one.next(), { brothers: [] });
+    assert.deepStrictEqual(await one.closed, { code: CLOSE_BAD_TOKEN, reason: 'token expired' });
+    await pingPong(v2);
+    v2.close();
+  } finally {
+    await r.close();
+  }
+});
+
+test('a frame over the limit is dropped in every direction, and no socket closes', async () => {
+  const r = await relay();
+  try {
+    const one = connect(pcUrl(r.base, secrets.one, sign(keyA, claimsFor('user_1')), 'Desk'));
+    await one.next();
+    const phone = connect(`${r.base}/phone?id=${R.pcId(secrets.one)}`);
+    await phone.next();
+    const phoneCh = (await one.next()).open;
+    const two = connect(pcUrl(r.base, secrets.two, sign(keyA, claimsFor('user_1')), 'Laptop'));
+    await two.next();
+    await one.next();
+    two.send(JSON.stringify({ join: { to: R.pcId(secrets.one) } }));
+    const asked = await one.next();
+    const link = await two.next();
+
+    const big = Buffer.alloc(R.MAX_FRAME + 1, 1);
+    // Brother to brother, then a small one that must still pass.
+    two.send(R.frame(link.link, big));
+    two.send(R.frame(link.link, Buffer.from('after')));
+    assert.strictEqual(R.unframe(await one.next()).payload.toString(), 'after');
+    // PC to phone, on its channel and by broadcast.
+    one.send(R.frame(phoneCh, big));
+    one.send(R.frame(R.BROADCAST, big));
+    one.send(R.frame(phoneCh, Buffer.from('small')));
+    assert.strictEqual((await phone.next()).toString(), 'small');
+    // Phone to PC.
+    phone.send(big);
+    phone.send(Buffer.from('tiny'));
+    assert.strictEqual(R.unframe(await one.next()).payload.toString(), 'tiny');
+    // Exactly the limit still passes.
+    one.send(R.frame(phoneCh, Buffer.alloc(R.MAX_FRAME, 2)));
+    assert.strictEqual((await phone.next()).length, R.MAX_FRAME);
+    for (const w of [one, two, phone]) assert.strictEqual(w.readyState, WebSocket.OPEN);
+    assert.strictEqual(one.queueLength() + two.queueLength() + phone.queueLength(), 0);
+
+    // Past the hard cap the socket may close, so memory stays bounded.
+    two.send(Buffer.alloc(R.HARD_FRAME + 8));
+    assert.strictEqual((await two.closed).code, 1009);
+    one.close();
+    phone.close();
+  } finally {
     await r.close();
   }
 });

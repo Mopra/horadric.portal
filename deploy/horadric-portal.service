@@ -14,6 +14,11 @@ Environment=PORT=43200
 Environment=TRUST_PROXY=1
 # The WorkOS client whose access tokens sign in a PC (staging for now).
 Environment=WORKOS_CLIENT_ID=client_01M5NBZGRP0NVJ69V5TP9S6PH3,client_01M5NBZGDSBPJMPR5BSJQ9ASEA
+# When the relay first saw each signed in PC id, kept across restarts.
+# systemd makes it, owned by the service user, writable under ProtectSystem.
+StateDirectory=horadric-portal
+StateDirectoryMode=0700
+Environment=STATE_DIR=/var/lib/horadric-portal
 ExecStart=/usr/bin/node server.js
 Restart=always
 RestartSec=2
