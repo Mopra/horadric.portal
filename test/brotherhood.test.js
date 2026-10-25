@@ -581,22 +581,6 @@ test('a missing or broken state file starts the relay empty', async () => {
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
-test('a signed in PC is closed with 4401 when its token expires, a v2 PC stays', async () => {
-  // The relay's clock is just short of the token's expiry.
-  const r = await relay({ now: () => Date.now() + 299_000 });
-  try {
-    const v2 = connect(pcUrl(r.base, secrets.two));
-    await v2.opened;
-    const one = connect(pcUrl(r.base, secrets.one, sign(keyA, claimsFor('user_1', { exp: nowS() + 300 })), 'Desk'));
-    assert.deepStrictEqual(await one.next(), { brothers: [] });
-    assert.deepStrictEqual(await one.closed, { code: CLOSE_BAD_TOKEN, reason: 'token expired' });
-    await pingPong(v2);
-    v2.close();
-  } finally {
-    await r.close();
-  }
-});
-
 test('a frame over the limit is dropped in every direction, and no socket closes', async () => {
   const r = await relay();
   try {

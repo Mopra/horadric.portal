@@ -41,8 +41,6 @@ function reject(socket, code) {
 // How long a change to the first-seen map waits before it is written, so a
 // burst of connects costs one write.
 const SAVE_AFTER = 5000;
-// setTimeout fires at once past this, so a later expiry is checked again.
-const MAX_TIMER = 0x7fffffff;
 
 const log = (...a) => console.log(...a);
 
@@ -251,26 +249,6 @@ function createRelay(options = {}) {
     sendText(r.pc, { link: mine, id: t.id, name: t.name });
   }
 
-  // A signed in PC is closed when its token runs out, as one presented
-  // expired would be refused; it signs in again and reconnects. Until then
-  // a token taken from it would keep a socket open for as long as it liked.
-  function expireAt(ws, r, exp) {
-    if (!Number.isFinite(exp)) return;
-    let timer;
-    const check = () => {
-      const left = exp * 1000 - now();
-      if (left > 0) {
-        timer = setTimeout(check, Math.min(left, MAX_TIMER));
-        timer.unref();
-        return;
-      }
-      if (r.pc === ws) detach(r);
-      ws.close(CLOSE_BAD_TOKEN, 'token expired');
-    };
-    check();
-    ws.once('close', () => clearTimeout(timer));
-  }
-
   // Past MAX_FRAME a frame is dropped and the socket kept, so one too large
   // message costs that message, not the machine's link and its phones.
   function fits(payload, from, id) {
@@ -300,7 +278,6 @@ function createRelay(options = {}) {
       if (!users.has(user)) users.set(user, new Set());
       users.get(user).add(id);
       tellBrothers(user);
-      expireAt(ws, r, exp);
     }
     ws.on('message', (data, isBinary) => {
       if (!isBinary) {
