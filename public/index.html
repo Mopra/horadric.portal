@@ -18,9 +18,9 @@
 <header id="bar">
   <button id="back" class="icon" hidden aria-label="Back">&#8249;</button>
   <div id="title">Horadric</div>
-  <select id="pcs" hidden aria-label="Computer"></select>
   <span id="status" class="status"><i class="lamp"></i><span>Starting</span></span>
 </header>
+<nav id="tabs" role="tablist" aria-label="Computers" hidden></nav>
 
 <main id="unpaired" class="view" hidden>
   <h1>Town Portal</h1>
@@ -41,7 +41,7 @@
 
 <main id="list" class="view" hidden>
   <div id="note" class="note" hidden></div>
-  <div class="tools"><button id="openquests" class="pill">Quests</button><button id="openproject" class="pill">Open project</button></div>
+  <div id="listtools" class="tools"><button id="openquests" class="pill">Quests</button><button id="openproject" class="pill">Open project</button></div>
   <div id="inbox" hidden></div>
   <div id="groups"></div>
   <div id="empty" class="dim center" hidden>No sessions on this PC.</div>

@@ -50,7 +50,9 @@ function pairWith(fragment) {
   }
   pcs.push(pc);
   savePcs(pcs);
-  localStorage.setItem('horadric.current', id);
+  try {
+    localStorage.setItem('horadric.tab', id);
+  } catch {}
   return true;
 }
 
@@ -81,12 +83,14 @@ function holdAnswer(open, a) {
 // Sends the held answer once, if the session still waits on the same
 // thing: the wait that began at `since` when the push said so, and one of
 // its options when the PC lists them. A wait that moved on keeps its keys.
-function sendHeldAnswer() {
+function sendHeldAnswer(L) {
   const a = state.answer;
-  if (!a || !state.pc || (a.pc && a.pc !== state.pc.id)) return;
+  if (!a || (a.pc && a.pc !== L.pc.id)) return;
+  const s = L.sessions.find((x) => x.id === a.id);
+  // A push from a PC that names none is for whichever PC lists the session.
+  if (!s && !a.pc && many()) return;
   state.answer = null;
   if (Date.now() - a.at > ANSWER_FOR) return;
-  const s = state.sessions.find((x) => x.id === a.id);
   if (!s || phaseOf(s) !== 'waiting' || s.paused) return;
   const at = askSince(s);
   if (a.since && at && at !== (a.since < 1e12 ? a.since * 1000 : a.since)) return;
@@ -154,88 +158,134 @@ async function open(key, buf) {
 
 // State
 
+// Every paired PC has a link of its own, all open at once: its socket,
+// its key, its replay count, and what it last said.
+function newLink(pc) {
+  return {
+    pc,
+    key: null,
+    ws: null,
+    link: 'connecting', // connecting | offline (relay down) | pcoff | online
+    greeted: false, // the PC answered this connection's hello
+    s: null, // this connection's id from the PC's hello, sent back on every message
+    n: 0, // the count on the last message sent
+    answered: null, // the timer that gives up on a PC that never answers hello
+    heard: 0, // when the relay last said anything, ms
+    backoff: 1000,
+    timer: null,
+    tooOld: false,
+    warning: null, // a note that stays: another phone took this phone's pairing code
+    vapid: null,
+    sessions: [],
+    projects: [],
+    take: [], // a silent brother's sessions this PC can take over
+    taking: null,
+    listed: false, // a sessions answer came from this PC, so the list is real
+    starting: null, // { project, at }
+    folders: null, // the PC's folders answer, null until it comes
+    quests: null, // the PC's quests answer, null until it comes
+    added: null, // { project, at } while an added quest is on its way
+    sent: new Map(), // session id -> { label, since }: an inbox answer sent, until the phase moves
+  };
+}
+
+// The link that listed a session, so a row tapped in "All" opens it on
+// the PC it lives on.
+const owner = new WeakMap();
+
 const state = {
-  pc: null,
+  links: [], // one per paired PC, in the order they were paired
+  tab: 'all', // 'all' or a PC's id
   open: null, // the session a notification asked to show, {id, pc}
   answer: null, // a notification button's answer, until its PC lists sessions, see holdAnswer
-  key: null,
-  ws: null,
-  link: 'connecting', // connecting | offline (relay down) | pcoff | online
-  pcName: '',
-  sessions: [],
-  projects: [],
-  vapid: null,
-  s: null, // this connection's id from the PC's hello, sent back on every message
-  n: 0, // the count on the last message sent
-  answered: null, // the timer that gives up on a PC that never answers hello
-  warning: null, // a note that stays: another phone took this phone's pairing code
-  starting: null, // { project, at }
+  wlink: null, // the link of the watched session
   paused: false, // the watched session answered watch with paused
-  heard: 0, // when the relay last said anything, ms
   watching: null,
   screen: null,
-  backoff: 1000,
-  timer: null,
-  tooOld: false,
   view: 'list', // unpaired | list | projects | quests | session
-  folders: null, // the PC's folders answer, null until it comes
   changes: null, // the watched session's changed files, null until the PC answers
   changesOpen: false, // whether the list of them is open
   watchedPhase: null, // the watched session's phase, to ask again when it moves
   diffPath: null, // the file whose diff is shown
   diff: null, // the PC's diff answer for it
   diffError: null,
-  quests: null, // the PC's quests answer, null until it comes
   adding: null, // the project whose add-a-quest form is open
   notesOpen: new Set(), // the quests whose notes show, by project and title
-  added: null, // { project, at } while an added quest is on its way
   sheet: null, // the long press menu, see openSheet
-  replyWait: null, // { id, resolve, reject, timer } while a reply is asked for
-  listed: false, // a sessions answer came from this PC, so the list is real
-  sent: new Map(), // session id -> { label, since }: an inbox answer sent, until the phase moves
+  replyWait: null, // { id, L, resolve, reject, timer } while a reply is asked for
 };
 
-function setLink(link) {
-  state.link = link;
+const many = () => state.links.length > 1;
+const linkOf = (id) => state.links.find((L) => L.pc.id === id) || null;
+
+// The PC the tab in front is about: the only one, or the one whose tab is
+// picked. Null in "All" with several.
+function tabLink() {
+  return many() ? linkOf(state.tab) : state.links[0] || null;
+}
+
+// The PC whatever is done now goes to: the watched session's, else the tab's.
+function here() {
+  return state.wlink || tabLink();
+}
+
+// The PCs the list shows.
+function shownLinks() {
+  const L = tabLink();
+  return L ? [L] : state.links;
+}
+
+function setLink(L, link) {
+  L.link = link;
+  if (link !== 'online') L.greeted = false;
+  renderTabs();
+  renderStatus();
+  renderNote();
+  renderList();
+  if (state.view === 'quests' && here() === L) renderQuests();
+}
+
+function renderStatus() {
+  const L = here();
+  $('status').hidden = !L || state.view === 'unpaired';
+  if (!L) return;
   const lamp = $('status').querySelector('.lamp');
   const label = $('status').querySelector('span');
   const words = { connecting: 'Connecting', offline: 'No relay', pcoff: 'PC offline', online: 'Online' };
-  lamp.className = 'lamp ' + (link === 'online' ? 'online' : link === 'connecting' ? 'connecting' : 'offline');
-  label.textContent = words[link];
-  renderNote();
-  renderList();
-  if (state.view === 'quests') renderQuests();
+  lamp.className = 'lamp ' + (L.link === 'online' ? 'online' : L.link === 'connecting' ? 'connecting' : 'offline');
+  label.textContent = words[L.link];
 }
 
 // Connection
 
-async function connect() {
-  clearTimeout(state.timer);
-  if (state.ws) {
-    state.ws.onclose = null;
-    state.ws.close();
-    state.ws = null;
+async function connect(L) {
+  clearTimeout(L.timer);
+  if (L.ws) {
+    L.ws.onclose = null;
+    L.ws.close();
+    L.ws = null;
   }
-  const pc = state.pc;
-  if (!pc) return;
-  setLink('connecting');
-  state.s = null;
+  if (!state.links.includes(L)) return;
+  L.s = null;
   try {
-    state.key = await importKey(pc.pk || pc.k);
+    L.key = await importKey(L.pc.pk || L.pc.k);
   } catch {
-    $('note').hidden = false;
-    $('note').textContent = 'This pairing link is broken. Pair again with horadric portal.';
+    // A PC that forgot this phone has said so already, in a note that stays.
+    L.warning ||= 'This pairing link is broken. Pair again with horadric portal.';
+    setLink(L, 'offline');
     return;
   }
-  const ws = new WebSocket(`${pc.r}/phone?id=${pc.id}`);
+  setLink(L, 'connecting');
+  const ws = new WebSocket(`${L.pc.r}/phone?id=${L.pc.id}`);
   ws.binaryType = 'arraybuffer';
-  state.ws = ws;
+  L.ws = ws;
   ws.onopen = () => {
-    state.backoff = 1000;
-    state.heard = Date.now();
+    L.backoff = 1000;
+    L.heard = Date.now();
   };
   ws.onmessage = async (ev) => {
-    state.heard = Date.now();
+    if (L.ws !== ws) return;
+    L.heard = Date.now();
     if (typeof ev.data === 'string') {
       let msg;
       try {
@@ -245,29 +295,68 @@ async function connect() {
       }
       if (msg.pong) return;
       if (msg.relay === 'online') {
-        setLink('online');
-        if (state.pc.pk) pairNow();
-        else greet();
+        setLink(L, 'online');
+        if (L.pc.pk) pairNow(L);
+        else greet(L);
       } else if (msg.relay === 'offline') {
-        setLink('pcoff');
+        setLink(L, 'pcoff');
       }
       return;
     }
     let msg;
     try {
-      msg = await open(state.key, ev.data);
+      msg = await open(L.key, ev.data);
     } catch {
       return;
     }
-    onMessage(msg);
+    onMessage(L, msg);
   };
   ws.onclose = () => {
-    if (state.ws !== ws) return;
-    state.ws = null;
-    setLink('offline');
-    state.timer = setTimeout(connect, state.backoff);
-    state.backoff = Math.min(state.backoff * 2, 15000);
+    if (L.ws !== ws) return;
+    L.ws = null;
+    setLink(L, 'offline');
+    L.timer = setTimeout(() => connect(L), L.backoff);
+    L.backoff = Math.min(L.backoff * 2, 15000);
   };
+}
+
+// A forgotten PC's link goes quiet for good.
+function drop(L) {
+  clearTimeout(L.timer);
+  clearTimeout(L.answered);
+  if (L.ws) {
+    L.ws.onclose = null;
+    L.ws.close();
+    L.ws = null;
+  }
+  if (state.sheet && state.sheet.L === L) closeSheet();
+  if (state.wlink === L) {
+    clearWatch();
+    show('list');
+  }
+}
+
+// The links follow the paired PCs: a new PC gets one, a forgotten one
+// loses its own, and a PC paired again (a new code or key) reconnects.
+function syncLinks() {
+  const old = state.links;
+  const fresh = [];
+  state.links = loadPcs().map((pc) => {
+    const L = old.find((x) => x.pc.id === pc.id);
+    if (!L) {
+      const made = newLink(pc);
+      fresh.push(made);
+      return made;
+    }
+    if (pc.pk !== L.pc.pk || pc.k !== L.pc.k) {
+      L.warning = null;
+      fresh.push(L);
+    }
+    L.pc = pc;
+    return L;
+  });
+  for (const L of old) if (!state.links.includes(L)) drop(L);
+  for (const L of fresh) connect(L);
 }
 
 // A socket can look open long after the network under it died, most of
@@ -276,67 +365,77 @@ async function connect() {
 const PING_MS = 25000;
 const SILENCE_MS = 70000;
 setInterval(() => {
-  const ws = state.ws;
-  if (!ws || ws.readyState !== 1) return;
-  if (Date.now() - state.heard > SILENCE_MS) return connect();
-  ws.send('{"ping":1}');
+  for (const L of state.links) {
+    const ws = L.ws;
+    if (!ws || ws.readyState !== 1) continue;
+    if (Date.now() - L.heard > SILENCE_MS) connect(L);
+    else ws.send('{"ping":1}');
+  }
 }, PING_MS);
 
 // Back in front, or back on a network: a socket from before is likely
 // dead, so check at once instead of waiting for the next ping.
 function wake() {
-  if (!state.pc) return;
-  const ws = state.ws;
-  if (!ws || ws.readyState !== 1 || Date.now() - state.heard > PING_MS) connect();
-  else ws.send('{"ping":1}');
+  for (const L of state.links) {
+    if (!L.pc.k && !L.pc.pk) continue;
+    const ws = L.ws;
+    if (!ws || ws.readyState !== 1 || Date.now() - L.heard > PING_MS) connect(L);
+    else ws.send('{"ping":1}');
+  }
 }
 
 // After hello every message carries the connection's s and a count, so
 // the relay cannot play an old one back to the PC.
-async function send(obj) {
-  const ws = state.ws;
-  if (!ws || ws.readyState !== 1 || !state.key) return false;
-  if (state.s && obj.t !== 'hello' && obj.t !== 'pair') obj = { ...obj, s: state.s, n: ++state.n };
-  ws.send(await seal(state.key, obj));
+async function send(obj, L = here()) {
+  const ws = L && L.ws;
+  if (!ws || ws.readyState !== 1 || !L.key) return false;
+  if (L.s && obj.t !== 'hello' && obj.t !== 'pair') obj = { ...obj, s: L.s, n: ++L.n };
+  ws.send(await seal(L.key, obj));
   return true;
 }
 
-function greet() {
-  state.s = null;
-  send({ t: 'hello', v: VERSION });
-  clearTimeout(state.answered);
-  state.answered = setTimeout(
-    () => say('The PC does not answer this phone. It may have forgotten it: run horadric portal on the PC and pair again.'),
+// A note from one PC names it when there are several.
+function tell(L, text) {
+  say(many() ? `${L.pc.n}: ${text}` : text);
+}
+
+function greet(L) {
+  L.s = null;
+  L.greeted = false;
+  send({ t: 'hello', v: VERSION }, L);
+  clearTimeout(L.answered);
+  L.answered = setTimeout(
+    () => tell(L, 'The PC does not answer this phone. It may have forgotten it: run horadric portal on the PC and pair again.'),
     10000,
   );
 }
 
 // Trades the one-time code for a key of this phone's own.
-function pairNow() {
-  if (state.pc.x && Date.now() / 1000 > state.pc.x) {
-    codeFailed('This pairing code ran out. Run horadric portal on the PC for a new one.');
+function pairNow(L) {
+  if (L.pc.x && Date.now() / 1000 > L.pc.x) {
+    codeFailed(L, 'This pairing code ran out. Run horadric portal on the PC for a new one.');
     return;
   }
-  send({ t: 'pair', v: VERSION, name: deviceName() });
+  send({ t: 'pair', v: VERSION, name: deviceName() }, L);
 }
 
 // The code was used or ran out: forget it, and go on with the key this
 // phone had before, if any.
-function codeFailed(text, used) {
-  const pc = state.pc;
-  if (used) state.warning = text;
+function codeFailed(L, text, used) {
+  const pc = L.pc;
+  if (used) L.warning = text;
   delete pc.pk;
   delete pc.x;
   savePc(pc);
-  if (pc.k) connect();
-  else if (!used) say(text);
+  if (pc.k) connect(L);
+  else if (!used) tell(L, text);
   renderNote();
 }
 
-async function paired(msg) {
-  const pc = state.pc;
+async function paired(L, msg) {
+  const pc = L.pc;
   try {
-    state.key = await importKey(msg.key);
+    L.key = await importKey(msg.key);
   } catch {
     return;
   }
@@ -345,158 +444,162 @@ async function paired(msg) {
   delete pc.pk;
   delete pc.x;
   savePc(pc);
-  greet();
+  greet(L);
 }
 
 // The PC forgot this phone, so its key is no good any more.
-function unpaired() {
-  const pc = state.pc;
+function unpaired(L) {
+  const pc = L.pc;
   delete pc.k;
   savePc(pc);
-  if (state.ws) {
-    state.ws.onclose = null;
-    state.ws.close();
-    state.ws = null;
+  if (L.ws) {
+    L.ws.onclose = null;
+    L.ws.close();
+    L.ws = null;
   }
-  setLink('offline');
-  say(`${pc.n} forgot this phone. To use it again, run horadric portal on the PC and pair again.`);
+  L.warning = `${pc.n} forgot this phone. To use it again, run horadric portal on the PC and pair again.`;
+  setLink(L, 'offline');
 }
 
-function onMessage(msg) {
+function onMessage(L, msg) {
+  const watched = state.wlink === L;
   switch (msg.t) {
     case 'paired':
-      paired(msg);
+      paired(L, msg);
       break;
     case 'unpaired':
-      unpaired();
+      unpaired(L);
       break;
     case 'hello':
-      clearTimeout(state.answered);
-      state.s = typeof msg.s === 'string' ? msg.s : null;
-      state.n = 0;
-      if (state.watching) send({ t: 'watch', id: state.watching });
-      askChanges();
-      if (state.diffPath) send({ t: 'diff', id: state.watching, path: state.diffPath });
-      state.tooOld = !SPEAKS.includes(msg.v);
-      state.pcName = msg.pc || state.pc.n;
-      if (msg.pc && msg.pc !== state.pc.n) {
-        state.pc.n = msg.pc;
-        savePc(state.pc);
-        renderPcs();
+      clearTimeout(L.answered);
+      L.s = typeof msg.s === 'string' ? msg.s : null;
+      L.n = 0;
+      L.greeted = true;
+      if (watched && state.watching) {
+        send({ t: 'watch', id: state.watching }, L);
+        askChanges();
+        if (state.diffPath) send({ t: 'diff', id: state.watching, path: state.diffPath }, L);
       }
-      state.vapid = typeof msg.vapid === 'string' ? msg.vapid : null;
+      L.tooOld = !SPEAKS.includes(msg.v);
+      if (msg.pc && msg.pc !== L.pc.n) {
+        L.pc.n = msg.pc;
+        savePc(L.pc);
+      }
+      L.vapid = typeof msg.vapid === 'string' ? msg.vapid : null;
+      renderTabs();
       renderNote();
       renderTitle();
       renderPush();
-      resendPush();
-      if (state.view === 'projects') askFolders();
-      if (state.view === 'quests') askQuests();
+      resendPush(L);
+      if (here() === L && state.view === 'projects') askFolders();
+      if (here() === L && state.view === 'quests') askQuests();
       break;
     case 'quests':
-      state.quests = Array.isArray(msg.list) ? msg.list : [];
-      renderQuests();
+      L.quests = Array.isArray(msg.list) ? msg.list : [];
+      if (here() === L) renderQuests();
       break;
     case 'quest_added':
       // The text stays in the form until the PC has it, so an error
       // costs nothing typed.
       if (addForm.el) addForm.el.reset();
-      state.added = null;
+      L.added = null;
       state.adding = null;
-      renderQuests();
+      if (here() === L) renderQuests();
       break;
     case 'projects':
-      state.projects = Array.isArray(msg.list) ? msg.list : [];
+      L.projects = Array.isArray(msg.list) ? msg.list : [];
       renderList();
       break;
     case 'started':
-      state.starting = null;
+      L.starting = null;
       renderList();
-      renderFolders();
-      if (msg.id) watch(msg.id);
+      if (here() === L) renderFolders();
+      if (msg.id) watch(msg.id, null, L);
       break;
     case 'folders':
-      state.folders = Array.isArray(msg.roots) ? msg.roots : [];
-      renderFolders();
+      L.folders = Array.isArray(msg.roots) ? msg.roots : [];
+      if (here() === L) renderFolders();
       break;
     case 'sessions':
-      state.listed = true;
-      state.sessions = Array.isArray(msg.list) ? msg.list : [];
+      L.listed = true;
+      L.sessions = Array.isArray(msg.list) ? msg.list.filter((s) => s && typeof s === 'object') : [];
+      for (const s of L.sessions) owner.set(s, L);
       // A silent brother's sessions this PC can take over, apart from its
       // own so nothing else treats them as the PC's.
-      state.take = Array.isArray(msg.take) ? msg.take : [];
-      if (state.taking && !state.take.some((x) => x.id === state.taking)) state.taking = null;
-      pruneSent();
-      sendHeldAnswer();
+      L.take = Array.isArray(msg.take) ? msg.take : [];
+      if (L.taking && !L.take.some((x) => x.id === L.taking)) L.taking = null;
+      pruneSent(L);
+      sendHeldAnswer(L);
       renderList();
-      if (state.view === 'quests') renderQuests();
+      if (state.view === 'quests' && here() === L) renderQuests();
       renderTitle();
       renderBadge();
       // A rename being typed must not be reset by an update.
-      if (state.sheet && (state.sheet.mode !== 'rename' || !state.sessions.some((s) => s.id === state.sheet.id))) renderSheet();
+      if (state.sheet && state.sheet.L === L && (state.sheet.mode !== 'rename' || !L.sessions.some((s) => s.id === state.sheet.id))) renderSheet();
       // A turn that ends or starts waiting has likely changed files.
-      if (state.watching) {
-        const s = state.sessions.find((x) => x.id === state.watching);
+      if (watched && state.watching) {
+        const s = L.sessions.find((x) => x.id === state.watching);
         const phase = s ? s.phase : null;
         if (phase !== state.watchedPhase) askChanges();
         state.watchedPhase = phase;
       }
       break;
     case 'reply':
-      gotReply(msg);
+      gotReply(L, msg);
       break;
     case 'changes':
-      if (msg.id === state.watching) {
+      if (watched && msg.id === state.watching) {
         state.changes = Array.isArray(msg.files) ? msg.files.filter((f) => f && typeof f.path === 'string') : [];
         renderChanges();
         if (state.view === 'diff') renderDiff();
       }
       break;
     case 'diff':
-      if (msg.id === state.watching && msg.path === state.diffPath) {
+      if (watched && msg.id === state.watching && msg.path === state.diffPath) {
         state.diff = msg;
         renderDiff();
       }
       break;
     case 'screen':
-      if (msg.id === state.watching) {
+      if (watched && msg.id === state.watching) {
         state.paused = false;
         state.screen = msg;
         renderScreen();
       }
       break;
     case 'attached':
-      attached(msg);
+      if (watched) attached(msg);
       break;
     case 'error':
-      if (state.attaching) attachDone();
+      if (watched && state.attaching) attachDone();
       if (msg.code === 'used' || msg.code === 'expired') {
-        codeFailed(msg.text, msg.code === 'used');
+        codeFailed(L, msg.text, msg.code === 'used');
         break;
       }
-      if (state.watching && /paused/i.test(msg.text || '')) {
+      if (watched && state.watching && /paused/i.test(msg.text || '')) {
         state.paused = true;
         renderScreen();
         break;
       }
-      if (state.view === 'diff' && !state.diff) {
+      if (watched && state.view === 'diff' && !state.diff) {
         state.diffError = msg.text || 'The PC could not show this file.';
         renderDiff();
         break;
       }
-      if (state.starting) {
-        state.starting = null;
+      if (L.starting) {
+        L.starting = null;
         renderList();
-        renderFolders();
+        if (here() === L) renderFolders();
       }
-      if (state.taking) {
-        state.taking = null;
+      if (L.taking) {
+        L.taking = null;
         renderList();
       }
-      if (state.added) {
-        state.added = null;
-        renderQuests();
+      if (L.added) {
+        L.added = null;
+        if (here() === L) renderQuests();
       }
-      say(msg.text || 'The PC reported an error.');
+      tell(L, msg.text || 'The PC reported an error.');
       break;
   }
 }
@@ -506,21 +609,35 @@ function onMessage(msg) {
 const PHASES = ['working', 'waiting', 'idle', 'ended'];
 const phaseOf = (s) => (PHASES.includes(s.phase) ? s.phase : 'idle');
 
+function noteOf(L) {
+  if (L.warning) return L.warning;
+  if (L.tooOld) return 'This PC runs a Horadric this page does not speak. Update Horadric on the PC.';
+  if (L.link === 'pcoff') return `${L.pc.n} is not connected. Is Horadric running, with horadric portal on?`;
+  if (L.link === 'offline') return 'Cannot reach the relay. Retrying.';
+  return '';
+}
+
+// In "All" a PC that is merely off shows as its tab's grey dot, so only
+// what needs the human is said there, by the PC's name.
 function renderNote() {
-  const note = $('note');
+  const links = shownLinks();
   let text = '';
-  if (state.warning) text = state.warning;
-  else if (state.tooOld) text = 'This PC runs a Horadric this page does not speak. Update Horadric on the PC.';
-  else if (state.link === 'pcoff') text = `${state.pc ? state.pc.n : 'The PC'} is not connected. Is Horadric running, with horadric portal on?`;
-  else if (state.link === 'offline') text = 'Cannot reach the relay. Retrying.';
+  if (links.length === 1) text = noteOf(links[0]);
+  else if (links.length) {
+    const lines = links.filter((L) => L.warning || L.tooOld).map((L) => `${L.pc.n}: ${noteOf(L)}`);
+    if (links.every((L) => L.link === 'offline' && !L.warning)) lines.push('Cannot reach the relay. Retrying.');
+    text = lines.join(' ');
+  }
+  const note = $('note');
   note.hidden = !text;
   note.textContent = text;
 }
 
 // Sessions waiting on the human, longest wait first, and the count in the
 // tab title and the page's title bar.
-const waitingList = () =>
-  state.sessions
+const waitingList = (links = shownLinks()) =>
+  links
+    .flatMap((L) => L.sessions)
     .filter((s) => phaseOf(s) === 'waiting' && !s.paused)
     .sort((a, b) => (askSince(a) || Infinity) - (askSince(b) || Infinity));
 
@@ -545,12 +662,12 @@ function renderKeys(s) {
 
 function renderTitle() {
   renderDots();
-  const n = waitingList().length;
-  document.title = n ? `(${n}) Horadric` : 'Horadric';
+  const total = waitingList(state.links).length;
+  document.title = total ? `(${total}) Horadric` : 'Horadric';
   if (state.view === 'diff') {
     $('title').textContent = baseName(state.diffPath || '') || 'Changes';
   } else if (state.watching) {
-    const s = state.sessions.find((x) => x.id === state.watching);
+    const s = state.wlink && state.wlink.sessions.find((x) => x.id === state.watching);
     renderKeys(s);
     $('title').textContent = s ? s.name : 'Session';
   } else if (state.view === 'projects') {
@@ -558,7 +675,9 @@ function renderTitle() {
   } else if (state.view === 'quests') {
     $('title').textContent = 'Quests';
   } else {
-    $('title').textContent = (state.pc ? state.pc.n : 'Horadric') + (n ? ` (${n} waiting)` : '');
+    const L = tabLink();
+    const n = waitingList().length;
+    $('title').textContent = (L ? L.pc.n : 'Horadric') + (n ? ` (${n} waiting)` : '');
   }
 }
 
@@ -566,54 +685,119 @@ function renderTitle() {
 // page is shut. Where the browser has no badge, nothing.
 function renderBadge() {
   if (!navigator.setAppBadge) return;
-  const n = state.sessions.filter((s) => s.phase === 'waiting').length;
+  const n = state.links.reduce((t, L) => t + L.sessions.filter((s) => s.phase === 'waiting').length, 0);
   (n ? navigator.setAppBadge(n) : navigator.clearAppBadge()).catch(() => {});
 }
 
-function renderPcs() {
-  const pcs = loadPcs();
-  const sel = $('pcs');
-  sel.hidden = pcs.length < 2;
-  sel.replaceChildren(
-    ...pcs.map((p) => {
-      const o = document.createElement('option');
-      o.value = p.id;
-      o.textContent = p.n;
-      o.selected = state.pc && p.id === state.pc.id;
-      return o;
-    }),
-  );
+// "All", then a tab per PC with a dot: lit once the relay has the PC and
+// it answered hello. One PC needs no tabs, and only the list shows them.
+// The buttons are kept and only changed, since a status that comes
+// between a finger's down and up would otherwise lose the tap.
+function renderTabs() {
+  const bar = $('tabs');
+  bar.hidden = !many() || state.view !== 'list';
+  if (bar.hidden) return;
+  const tabs = [{ id: 'all', label: 'All' }, ...state.links.map((L) => ({ id: L.pc.id, label: L.pc.n, L }))];
+  if (bar.children.length !== tabs.length || tabs.some((t, i) => bar.children[i].dataset.id !== t.id)) {
+    bar.replaceChildren(
+      ...tabs.map((t) => {
+        const b = el('button', 'tab');
+        b.type = 'button';
+        b.dataset.id = t.id;
+        b.setAttribute('role', 'tab');
+        if (t.L) b.append(el('i', 'lamp'));
+        b.append(el('span'));
+        b.onclick = () => pickTab(t.id);
+        return b;
+      }),
+    );
+  }
+  tabs.forEach((t, i) => {
+    const b = bar.children[i];
+    const on = state.tab === t.id;
+    b.classList.toggle('on', on);
+    b.setAttribute('aria-selected', String(on));
+    b.lastChild.textContent = t.label;
+    if (t.L) {
+      const live = t.L.link === 'online' && t.L.greeted;
+      b.firstChild.className = 'lamp' + (live ? ' online' : '');
+      b.title = live ? `${t.label} is online` : `${t.label} is not reached`;
+    }
+  });
+}
+
+function pickTab(id) {
+  if (id !== 'all' && !linkOf(id)) id = 'all';
+  if (state.tab !== id) state.adding = null;
+  state.tab = id;
+  try {
+    localStorage.setItem('horadric.tab', id);
+  } catch {}
+  renderAll();
+}
+
+function storedTab() {
+  try {
+    return localStorage.getItem('horadric.tab') || 'all';
+  } catch {
+    return 'all';
+  }
+}
+
+// What is about one PC (its tools, its pairing, its notifications) shows
+// in its own tab, not in "All".
+function renderAll() {
+  const L = tabLink();
+  $('listtools').hidden = !L;
+  $('copylink').hidden = !L;
+  $('forget').hidden = !L;
+  $('empty').textContent = L ? 'No sessions on this PC.' : 'No sessions.';
+  renderTabs();
+  renderStatus();
+  renderNote();
+  renderTitle();
+  renderList();
+  renderPush();
 }
 
 const baseName = (p) => String(p).split(/[\\/]/).filter(Boolean).pop() || String(p);
 
-// Every project the PC knows, each with its sessions, so a project with
+// Every project the PCs know, each with its sessions, so a project with
 // none can still get one. A session names its project by name or path.
-function grouped() {
+// Over several PCs a project is one group by its name, as the stage
+// shows it, and `starts` says which PCs can start a session in it.
+function grouped(links = shownLinks()) {
   const groups = new Map();
-  const keyOf = new Map();
-  for (const p of state.projects) {
-    if (!p || !p.path) continue;
-    groups.set(p.path, { path: p.path, name: p.name || baseName(p.path), list: [] });
-    keyOf.set(p.path, p.path);
-    if (p.name && !keyOf.has(p.name)) keyOf.set(p.name, p.path);
-  }
-  for (const s of state.sessions) {
-    const raw = s.project || 'Other';
-    const key = keyOf.get(raw) || raw;
-    if (!groups.has(key)) groups.set(key, { path: null, name: baseName(raw), list: [] });
-    groups.get(key).list.push(s);
+  const merge = links.length > 1;
+  const group = (key, name) => {
+    if (!groups.has(key)) groups.set(key, { name, starts: [], list: [], order: Infinity });
+    return groups.get(key);
+  };
+  for (const L of links) {
+    const keyOf = new Map();
+    L.projects.forEach((p, i) => {
+      if (!p || !p.path) return;
+      const name = p.name || baseName(p.path);
+      const key = merge ? name.toLowerCase() : p.path;
+      const g = group(key, name);
+      g.starts.push({ L, path: p.path });
+      g.order = Math.min(g.order, i);
+      keyOf.set(p.path, key);
+      if (p.name && !keyOf.has(p.name)) keyOf.set(p.name, key);
+    });
+    for (const s of L.sessions) {
+      const raw = s.project || 'Other';
+      const key = keyOf.get(raw) || (merge ? baseName(raw).toLowerCase() : raw);
+      group(key, baseName(raw)).list.push(s);
+    }
   }
   const rank = (s) => (s.paused ? 2.5 : { waiting: 0, working: 1, idle: 2, ended: 3 }[phaseOf(s)]);
   const best = (g) => (g.list.length ? Math.min(...g.list.map(rank)) : 9);
-  const order = state.projects.map((p) => p && p.path);
   for (const g of groups.values()) g.list.sort((a, b) => rank(a) - rank(b) || String(a.name).localeCompare(b.name));
   return [...groups.values()].sort((a, b) => {
     const r = best(a) - best(b);
     if (r) return r;
-    const ia = order.indexOf(a.path);
-    const ib = order.indexOf(b.path);
-    if (ia >= 0 && ib >= 0) return ia - ib;
+    if (a.order !== b.order) return a.order - b.order;
     return a.name.localeCompare(b.name);
   });
 }
@@ -655,32 +839,36 @@ function ago(since) {
 
 // An answer is "Sent" until the session leaves that wait: its phase moves, or
 // a new ask replaces the one answered.
-function pruneSent() {
-  for (const [id, sent] of state.sent) {
-    const s = state.sessions.find((x) => x.id === id);
-    if (!s || phaseOf(s) !== 'waiting' || askSince(s) !== sent.since) state.sent.delete(id);
+function pruneSent(L) {
+  for (const [id, sent] of L.sent) {
+    const s = L.sessions.find((x) => x.id === id);
+    if (!s || phaseOf(s) !== 'waiting' || askSince(s) !== sent.since) L.sent.delete(id);
   }
 }
 
 function answer(s, opt) {
+  const L = owner.get(s);
+  if (!L) return;
   haptic('answer');
-  state.sent.set(s.id, { label: opt.label, since: askSince(s) });
-  send({ t: 'input', id: s.id, data: opt.keys });
+  L.sent.set(s.id, { label: opt.label, since: askSince(s) });
+  send({ t: 'input', id: s.id, data: opt.keys }, L);
   renderInbox();
 }
 
 function card(s) {
+  const L = owner.get(s);
   const ask = s.ask && typeof s.ask === 'object' ? s.ask : null;
   const c = el('article', 'card');
   const top = el('div', 'ctop');
   top.append(el('span', 'cproj', s.project ? baseName(s.project) : s.name || s.id));
+  if (many() && !tabLink()) top.append(el('span', 'cpc', L.pc.n));
   const since = askSince(s);
   if (since) top.append(el('span', 'cage', ago(since)));
   c.append(top);
   const what = ask ? [ask.tool, ask.detail].filter(Boolean).join(': ') : '';
   c.append(el('div', 'cwhat', what || s.line || 'Waiting for you'));
   const row = el('div', 'cbtns');
-  const sent = state.sent.get(s.id);
+  const sent = L.sent.get(s.id);
   const options = ask && Array.isArray(ask.options) ? ask.options.filter((o) => o && o.label && typeof o.keys === 'string') : [];
   if (sent) {
     row.append(el('span', 'csent', `Sent: ${sent.label}`));
@@ -692,7 +880,7 @@ function card(s) {
     }
   }
   const open = el('button', 'link', 'Open');
-  open.onclick = () => watch(s.id);
+  open.onclick = () => watch(s.id, null, L);
   row.append(open);
   c.append(row);
   return c;
@@ -712,33 +900,37 @@ setInterval(() => {
 
 function renderList() {
   renderInbox();
-  if (!state.listed && state.pc && (state.link === 'connecting' || state.link === 'online')) {
+  const links = shownLinks();
+  const all = links.length > 1;
+  if (!links.some((L) => L.listed) && links.some((L) => L.link === 'connecting' || L.link === 'online')) {
     $('groups').replaceChildren(...skeleton());
     $('empty').hidden = true;
     return;
   }
   const out = [];
-  const take = state.take || [];
-  if (take.length) out.push(takeSection(take));
-  for (const g of grouped()) {
+  if (!all && links.length && links[0].take.length) out.push(takeSection(links[0]));
+  for (const g of grouped(links)) {
     const sec = el('section', 'group');
     const head = el('div', 'ghead');
     head.append(el('h2', null, g.name));
-    if (g.path) {
+    // A project on several PCs is started from the tab of the one meant.
+    const start = g.starts.length === 1 ? g.starts[0] : null;
+    if (start) {
       const plus = el('button', 'plus', '+');
       plus.setAttribute('aria-label', `New session in ${g.name}`);
-      plus.disabled = !!state.starting || state.link !== 'online';
-      plus.onclick = () => startIn(g.path);
+      plus.disabled = !!start.L.starting || start.L.link !== 'online';
+      plus.onclick = () => startIn(start.path, undefined, start.L);
       head.append(plus);
     }
     sec.append(head);
-    const startingHere = state.starting && state.starting.project === g.path;
+    const startingHere = g.starts.some(({ L, path }) => L.starting && L.starting.project === path);
     if (startingHere) {
       const row = el('div', 'sess starting');
       row.append(el('i', 'spinner'), el('div', 'what', 'Starting a session...'));
       sec.append(row);
     }
     for (const s of g.list) {
+      const L = owner.get(s);
       const ph = phaseOf(s);
       const b = el('div', 'sess ' + ph + (s.paused ? ' paused' : ''));
       b.setAttribute('role', 'button');
@@ -746,44 +938,45 @@ function renderList() {
       const what = el('div', 'what');
       what.append(el('div', 'name', s.name || s.id), el('div', 'line', s.paused ? 'paused' : s.line || ph));
       b.append(el('i', 'lamp ' + (s.paused ? 'paused' : ph)), what);
+      if (all) b.append(el('span', 'where', L.pc.n));
       if (s.paused) {
         const r = el('button', 'resume', 'Resume');
         r.onclick = (ev) => {
           ev.stopPropagation();
-          resume(s.id);
+          resume(s.id, L);
         };
         b.append(r);
       }
-      b.onclick = () => watch(s.id);
-      holdable(b, () => openSheet(s.id));
+      b.onclick = () => watch(s.id, null, L);
+      holdable(b, () => openSheet(s.id, L));
       sec.append(b);
     }
     if (!g.list.length && !startingHere) sec.append(el('div', 'dim none', 'No sessions'));
     out.push(sec);
   }
   $('groups').replaceChildren(...out);
-  $('empty').hidden = out.length > 0 || state.link !== 'online';
+  $('empty').hidden = out.length > 0 || !links.some((L) => L.link === 'online');
 }
 
 // A silent brother's sessions, each with "Take over": the PC asks to
 // have it handed to itself, which for a brother that does not answer is
 // taking it over from what the PC keeps of it.
-function takeSection(take) {
+function takeSection(L) {
   const sec = el('section', 'group');
   const head = el('div', 'ghead');
   head.append(el('h2', null, 'Silent brothers'));
   sec.append(head);
-  for (const s of take) {
+  for (const s of L.take) {
     const b = el('div', 'sess paused');
     const what = el('div', 'what');
     const where = s.project ? `${s.project} · ` : '';
     what.append(el('div', 'name', s.name || s.id), el('div', 'line', where + (s.line || 'silent')));
     b.append(el('i', 'lamp paused'), what);
-    const r = el('button', 'resume', state.taking === s.id ? 'Taking over...' : 'Take over');
-    r.disabled = !!state.taking || state.link !== 'online';
+    const r = el('button', 'resume', L.taking === s.id ? 'Taking over...' : 'Take over');
+    r.disabled = !!L.taking || L.link !== 'online';
     r.onclick = () => {
-      state.taking = s.id;
-      send({ t: 'handoff', id: s.id, to: s.to });
+      L.taking = s.id;
+      send({ t: 'handoff', id: s.id, to: s.to }, L);
       renderList();
     };
     b.append(r);
@@ -803,20 +996,21 @@ function say(text) {
 
 // `ask` is the message that starts it: start in a known folder, or
 // create a new one. `path` only marks where the spinner goes.
-function startIn(path, ask = { t: 'start', project: path }) {
+function startIn(path, ask = { t: 'start', project: path }, L = here()) {
+  if (!L) return;
   const at = Date.now();
-  state.starting = { project: path, at };
+  L.starting = { project: path, at };
   $('pnote').hidden = true;
   renderList();
   renderFolders();
-  send(ask);
+  send(ask, L);
   // A PC that never answers must not leave the spinner forever.
   setTimeout(() => {
-    if (!state.starting || state.starting.at !== at) return;
-    state.starting = null;
+    if (!L.starting || L.starting.at !== at) return;
+    L.starting = null;
     renderList();
     renderFolders();
-    say('The PC did not start the session. Is its Horadric up to date?');
+    tell(L, 'The PC did not start the session. Is its Horadric up to date?');
   }, 30000);
 }
 
@@ -824,11 +1018,12 @@ function startIn(path, ask = { t: 'start', project: path }) {
 // that was not open on the PC can still be worked on.
 
 function askFolders() {
+  const L = here();
   const at = Date.now();
   askFolders.at = at;
-  send({ t: 'folders' });
+  send({ t: 'folders' }, L);
   setTimeout(() => {
-    if (askFolders.at !== at || state.folders || state.view !== 'projects') return;
+    if (askFolders.at !== at || !L || L.folders || state.view !== 'projects') return;
     say('The PC did not list its projects. Opening projects needs Horadric 0.22 or later on the PC.');
   }, 8000);
 }
@@ -851,14 +1046,17 @@ function nameProblem(name, root) {
   if (name.length > 64) return 'At most 64 characters.';
   if (!/^[A-Za-z0-9 ._-]+$/.test(name)) return 'Letters, digits, space, dot, dash and underscore only.';
   if (name.startsWith('.')) return 'It cannot start with a dot.';
-  const r = (state.folders || []).find((x) => x.path === root);
+  const L = here();
+  const r = ((L && L.folders) || []).find((x) => x.path === root);
   const lower = name.toLowerCase();
   if (r && (r.list || []).some((f) => String(f.name).toLowerCase() === lower)) return 'That folder exists. Open it from the list instead.';
   return '';
 }
 
 function renderFolders() {
-  const roots = state.folders || [];
+  const L = here();
+  if (!L) return;
+  const roots = L.folders || [];
   const sel = $('root');
   const keep = sel.value;
   sel.replaceChildren(
@@ -872,18 +1070,17 @@ function renderFolders() {
   if (roots.some((r) => r.path === keep)) sel.value = keep;
   $('newproject').disabled = !roots.length;
 
-  if (!state.folders) {
-    const wait = el('div', 'dim center', state.link === 'online' ? 'Asking the PC for its projects...' : 'Waiting for the PC...');
+  if (!L.folders) {
+    const wait = el('div', 'dim center', L.link === 'online' ? 'Asking the PC for its projects...' : 'Waiting for the PC...');
     $('folders').replaceChildren(wait);
     return;
   }
   const q = $('search').value.trim().toLowerCase();
-  const busy = !!state.starting || state.link !== 'online';
+  const busy = !!L.starting || L.link !== 'online';
   const out = [];
   for (const r of roots) {
     const list = (r.list || []).filter((f) => !q || String(f.name).toLowerCase().includes(q));
-    const creating =
-      state.starting && state.starting.root === r.path && !list.some((f) => f.path === state.starting.project);
+    const creating = L.starting && L.starting.root === r.path && !list.some((f) => f.path === L.starting.project);
     if (q && !list.length && !creating) continue;
     const sec = el('section', 'group root');
     sec.append(el('h2', null, r.name || baseName(r.path)), el('div', 'rpath', r.path));
@@ -893,17 +1090,17 @@ function renderFolders() {
       sec.append(row);
     }
     for (const f of list) {
-      const here = state.starting && state.starting.project === f.path;
-      const row = el('div', 'sess folder' + (here ? ' starting' : ''));
+      const busyHere = L.starting && L.starting.project === f.path;
+      const row = el('div', 'sess folder' + (busyHere ? ' starting' : ''));
       row.setAttribute('role', 'button');
       row.tabIndex = 0;
       const what = el('div', 'what');
       what.append(el('div', 'name', f.name || baseName(f.path)));
-      if (here) what.append(el('div', 'line', 'Starting a session...'));
-      row.append(here ? el('i', 'spinner') : el('i', 'lamp'), what);
+      if (busyHere) what.append(el('div', 'line', 'Starting a session...'));
+      row.append(busyHere ? el('i', 'spinner') : el('i', 'lamp'), what);
       if (f.git) row.append(el('span', 'git', 'git'));
       row.onclick = () => {
-        if (!busy) startIn(f.path);
+        if (!busy) startIn(f.path, undefined, L);
       };
       sec.append(row);
     }
@@ -918,11 +1115,12 @@ function renderFolders() {
 // reads them and adds to them; it does not drive anything yet.
 
 function askQuests() {
+  const L = here();
   const at = Date.now();
   askQuests.at = at;
-  send({ t: 'quests' });
+  send({ t: 'quests' }, L);
   setTimeout(() => {
-    if (askQuests.at !== at || state.quests || state.view !== 'quests') return;
+    if (askQuests.at !== at || !L || L.quests || state.view !== 'quests') return;
     say('The PC did not send its quests. Quests on the phone need Horadric 0.24 or later on the PC.');
   }, 8000);
 }
@@ -955,13 +1153,15 @@ function warrivWords(log) {
 }
 
 function renderQuests() {
-  if (!state.quests) {
-    const wait = el('div', 'dim center', state.link === 'online' ? 'Asking the PC for its quests...' : 'Waiting for the PC...');
+  const L = here();
+  if (!L) return;
+  if (!L.quests) {
+    const wait = el('div', 'dim center', L.link === 'online' ? 'Asking the PC for its quests...' : 'Waiting for the PC...');
     $('logs').replaceChildren(wait);
     return;
   }
   const out = [];
-  for (const log of state.quests) {
+  for (const log of L.quests) {
     if (!log || !log.project) continue;
     const quests = Array.isArray(log.quests) ? log.quests : [];
     const sec = el('section', 'group log');
@@ -969,7 +1169,7 @@ function renderQuests() {
     head.append(el('h2', null, log.name || baseName(log.project)));
     const plus = el('button', 'plus', '+');
     plus.setAttribute('aria-label', `New quest in ${log.name}`);
-    plus.disabled = state.link !== 'online';
+    plus.disabled = L.link !== 'online';
     plus.onclick = () => {
       state.adding = state.adding === log.project ? null : log.project;
       renderQuests();
@@ -979,8 +1179,8 @@ function renderQuests() {
     sec.append(head);
     const words = warrivWords(log);
     if (words) sec.append(el('div', 'warriv' + (log.warriv && log.warriv.drives ? ' drives' : ''), words));
-    if (state.adding === log.project) sec.append(addForm(log));
-    for (const q of quests) sec.append(questRow(log, q));
+    if (state.adding === log.project) sec.append(addForm(log, L));
+    for (const q of quests) sec.append(questRow(log, q, L));
     const done = Number(log.done) || 0;
     if (!quests.length) sec.append(el('div', 'dim none', done ? `All ${done} done` : 'No quests'));
     else if (done) sec.append(el('div', 'dim none', `${done} done`));
@@ -990,7 +1190,7 @@ function renderQuests() {
   $('logs').replaceChildren(...out);
 }
 
-function questRow(log, q) {
+function questRow(log, q, L) {
   const [word, lamp] = QUEST[q.state] || [q.state || '', ''];
   const id = log.project + '\n' + q.title;
   const notes = Array.isArray(q.notes) ? q.notes : [];
@@ -1005,13 +1205,13 @@ function questRow(log, q) {
   if (state.notesOpen.has(id)) what.append(el('div', 'notes' + (notes.length ? '' : ' dim'), notes.length ? notes.join('\n') : 'No notes'));
   row.append(el('i', 'lamp ' + lamp), what);
   // The session on it, which the phone can open like any other.
-  const holder = q.session && state.sessions.find((s) => s.id === q.session);
+  const holder = q.session && L.sessions.find((s) => s.id === q.session);
   if (holder) {
     const go = el('button', 'resume', 'Open');
     go.setAttribute('aria-label', `Open ${holder.name}`);
     go.onclick = (ev) => {
       ev.stopPropagation();
-      watch(holder.id);
+      watch(holder.id, null, L);
     };
     row.append(go);
   }
@@ -1024,12 +1224,12 @@ function questRow(log, q) {
 
 // The form a project's + opens. It is made once and moved, so what is
 // typed survives the re-renders an update from the PC causes.
-function addForm(log) {
+function addForm(log, L) {
   const f = (addForm.el ||= makeAddForm());
   f.dataset.project = log.project;
-  const sending = !!state.added;
+  const sending = !!L.added;
   const b = f.querySelector('button');
-  b.disabled = sending || state.link !== 'online';
+  b.disabled = sending || L.link !== 'online';
   b.textContent = sending ? 'Adding...' : 'Add quest';
   return f;
 }
@@ -1060,17 +1260,18 @@ function makeAddForm() {
       hint.textContent = 'Say what the quest is.';
       return;
     }
-    if (state.added || state.link !== 'online') return;
+    const L = here();
+    if (!L || L.added || L.link !== 'online') return;
     const project = f.dataset.project;
     const at = Date.now();
-    state.added = { project, at };
-    send({ t: 'quest_add', project, title: t, notes: notes.value });
+    L.added = { project, at };
+    send({ t: 'quest_add', project, title: t, notes: notes.value }, L);
     haptic('send');
     hint.textContent = '';
     renderQuests();
     setTimeout(() => {
-      if (!state.added || state.added.at !== at) return;
-      state.added = null;
+      if (!L.added || L.added.at !== at) return;
+      L.added = null;
       renderQuests();
       say('The PC did not add the quest. Adding quests needs Horadric 0.24 or later on the PC.');
     }, 10000);
@@ -1078,9 +1279,9 @@ function makeAddForm() {
   return f;
 }
 
-function resume(id) {
-  send({ t: 'resume', id });
-  watch(id);
+function resume(id, L = here()) {
+  send({ t: 'resume', id }, L);
+  watch(id, null, L);
 }
 
 // Push
@@ -1096,16 +1297,20 @@ function pushSupport() {
   return null;
 }
 
+// Notifications are turned on in a PC's own tab, since each PC signs its
+// pushes with a key of its own.
 function renderPush() {
   const b = $('notify');
   const hint = $('notifyhint');
-  const why = state.vapid ? pushSupport() : null;
+  const L = tabLink();
+  const vapid = L && L.vapid;
+  const why = vapid ? pushSupport() : null;
   let text = why;
-  let button = !!state.vapid && !why;
+  let button = !!vapid && !why;
   if (button && Notification.permission === 'denied') {
     button = false;
     text = 'Notifications are blocked for this page in the browser settings.';
-  } else if (button && Notification.permission === 'granted' && localStorage.getItem('horadric.push.' + state.pc.id) === state.vapid) {
+  } else if (button && Notification.permission === 'granted' && localStorage.getItem('horadric.push.' + L.pc.id) === vapid) {
     button = false;
     text = 'You get a notification when a session waits.';
   }
@@ -1114,10 +1319,10 @@ function renderPush() {
   hint.textContent = text || '';
 }
 
-async function subscription(create) {
+async function subscription(create, vapid) {
   const reg = await navigator.serviceWorker.ready;
   let sub = await reg.pushManager.getSubscription();
-  const want = b64url(state.vapid);
+  const want = b64url(vapid);
   if (sub && sub.options && sub.options.applicationServerKey) {
     const have = new Uint8Array(sub.options.applicationServerKey);
     if (have.length !== want.length || have.some((x, i) => x !== want[i])) {
@@ -1133,12 +1338,16 @@ async function subscription(create) {
 }
 
 async function enablePush() {
+  const L = tabLink();
+  if (!L || !L.vapid) return;
   try {
     if ((await Notification.requestPermission()) === 'granted') {
-      const sub = await subscription(true);
-      if (sub && (await send({ t: 'push', sub: sub.toJSON() }))) {
-        localStorage.setItem('horadric.push.' + state.pc.id, state.vapid);
+      const sub = await subscription(true, L.vapid);
+      if (sub && (await send({ t: 'push', sub: sub.toJSON() }, L))) {
+        localStorage.setItem('horadric.push.' + L.pc.id, L.vapid);
       }
+      // Every other PC that signs with the same key can push to it too.
+      for (const o of state.links) if (o !== L) resendPush(o);
     }
     renderPush();
   } catch (e) {
@@ -1148,13 +1357,14 @@ async function enablePush() {
   }
 }
 
-// The PC dedupes, so sending the subscription on every hello costs little
-// and heals a PC that lost it (a rekey, a new install).
-async function resendPush() {
-  if (!state.vapid || pushSupport() || Notification.permission !== 'granted') return;
+// Every PC is sent the subscription on every hello: the PC dedupes, so it
+// costs little and heals a PC that lost it (a rekey, a new install). A PC
+// whose key is not the one subscribed with could not push to it.
+async function resendPush(L) {
+  if (!L.vapid || pushSupport() || Notification.permission !== 'granted') return;
   try {
-    const sub = await subscription(false);
-    if (sub) send({ t: 'push', sub: sub.toJSON() });
+    const sub = await subscription(false, L.vapid);
+    if (sub && (await send({ t: 'push', sub: sub.toJSON() }, L))) localStorage.setItem('horadric.push.' + L.pc.id, L.vapid);
   } catch {}
 }
 
@@ -1533,11 +1743,11 @@ function holdable(target, fn) {
   });
 }
 
-// sheet: { id, mode: menu | rename | stop | reply, text, copied }
-function openSheet(id) {
-  if (!state.sessions.some((s) => s.id === id)) return;
-  if (state.sheet && state.sheet.id === id) return;
-  state.sheet = { id, mode: 'menu' };
+// sheet: { id, L, mode: menu | rename | stop | reply, text, copied }
+function openSheet(id, L) {
+  if (!L || !L.sessions.some((s) => s.id === id)) return;
+  if (state.sheet && state.sheet.id === id && state.sheet.L === L) return;
+  state.sheet = { id, L, mode: 'menu' };
   renderSheet();
 }
 
@@ -1561,10 +1771,10 @@ function sheetButton(label, cls, onclick) {
 function renderSheet() {
   const sh = state.sheet;
   if (!sh) return closeSheet();
-  const s = state.sessions.find((x) => x.id === sh.id);
+  const s = sh.L.sessions.find((x) => x.id === sh.id);
   if (!s) return closeSheet();
   const name = s.name || s.id;
-  const online = state.link === 'online';
+  const online = sh.L.link === 'online';
   $('sheettitle').textContent = name;
   const body = [];
   if (sh.mode === 'menu') {
@@ -1594,7 +1804,7 @@ function renderSheet() {
     form.append(input, el('p', 'dim', 'Leave it empty and Claude names it again.'), save);
     form.onsubmit = (ev) => {
       ev.preventDefault();
-      rename(s.id, input.value.trim());
+      rename(s.id, input.value.trim(), sh.L);
     };
     body.push(form);
     setTimeout(() => {
@@ -1604,7 +1814,7 @@ function renderSheet() {
   } else if (sh.mode === 'stop') {
     body.push(
       el('p', 'sheettext', 'Stop this session? Its agent is ended on the PC and its tile goes, as closing its pane does.'),
-      sheetButton('Stop session', 'danger', () => stopSession(s.id)),
+      sheetButton('Stop session', 'danger', () => stopSession(s.id, sh.L)),
     );
   } else if (sh.mode === 'reply') {
     if (sh.none) {
@@ -1647,10 +1857,11 @@ function copyReply() {
   sh.text = null;
   sh.none = null;
   sh.copied = false;
-  const id = sh.id;
+  const { id, L } = sh;
   const answer = new Promise((resolve, reject) => {
     state.replyWait = {
       id,
+      L,
       resolve,
       reject,
       timer: setTimeout(() => {
@@ -1676,13 +1887,13 @@ function copyReply() {
       })
       .catch(() => {});
   }
-  send({ t: 'reply', id });
+  send({ t: 'reply', id }, L);
   renderSheet();
 }
 
-function gotReply(msg) {
+function gotReply(L, msg) {
   const w = state.replyWait;
-  if (!w || w.id !== msg.id) return;
+  if (!w || w.id !== msg.id || w.L !== L) return;
   clearTimeout(w.timer);
   state.replyWait = null;
   const text = typeof msg.text === 'string' && msg.text ? msg.text : null;
@@ -1695,26 +1906,26 @@ function gotReply(msg) {
 }
 
 // An older PC ignores these, so the page says so if nothing comes of them.
-function rename(id, name) {
+function rename(id, name, L) {
   closeSheet();
-  send({ t: 'rename', id, name });
+  send({ t: 'rename', id, name }, L);
   if (!name) return;
   setTimeout(() => {
-    const s = state.sessions.find((x) => x.id === id);
+    const s = L.sessions.find((x) => x.id === id);
     if (s && s.name !== name) say('The PC did not rename it. Renaming from the phone needs a newer Horadric on the PC.');
   }, 6000);
 }
 
-function stopSession(id) {
+function stopSession(id, L) {
   closeSheet();
-  send({ t: 'stop', id });
-  if (state.watching === id) history.back();
+  send({ t: 'stop', id }, L);
+  if (state.watching === id && state.wlink === L) history.back();
   setTimeout(() => {
-    if (state.sessions.some((x) => x.id === id)) say('The PC did not stop it. Stopping from the phone needs a newer Horadric on the PC.');
+    if (L.sessions.some((x) => x.id === id)) say('The PC did not stop it. Stopping from the phone needs a newer Horadric on the PC.');
   }, 8000);
 }
 
-holdable($('title'), () => state.watching && openSheet(state.watching));
+holdable($('title'), () => state.watching && openSheet(state.watching, state.wlink));
 $('sheet').addEventListener('click', (ev) => {
   if (ev.target === $('sheet')) closeSheet();
 });
@@ -1726,7 +1937,7 @@ document.addEventListener('keydown', (ev) => {
 
 // The sessions of the project the open one belongs to, in the list's order.
 function siblings() {
-  const g = grouped().find((x) => x.list.some((s) => s.id === state.watching));
+  const g = grouped().find((x) => x.list.some((s) => s.id === state.watching && owner.get(s) === state.wlink));
   return g ? g.list : [];
 }
 
@@ -1736,7 +1947,7 @@ function renderDots() {
   const list = state.watching ? siblings() : [];
   const box = $('dots');
   box.hidden = list.length < 2;
-  box.replaceChildren(...list.map((s) => el('i', s.id === state.watching ? 'on' : '')));
+  box.replaceChildren(...list.map((s) => el('i', s.id === state.watching && owner.get(s) === state.wlink ? 'on' : '')));
 }
 
 // The screen slides in from the side the swipe came from.
@@ -1768,9 +1979,9 @@ $('screenwrap').addEventListener('touchend', (ev) => {
   // Selecting text is not a swipe.
   if (String(getSelection()).length) return;
   const list = siblings();
-  const at = list.findIndex((s) => s.id === state.watching);
+  const at = list.findIndex((s) => s.id === state.watching && owner.get(s) === state.wlink);
   const to = list[at + (dx < 0 ? 1 : -1)];
-  if (to) watch(to.id, dx < 0 ? 'next' : 'prev');
+  if (to) watch(to.id, dx < 0 ? 'next' : 'prev', owner.get(to));
 });
 
 // How deep a view sits, so going deeper slides in from the right and back
@@ -1786,6 +1997,8 @@ function show(view) {
   const where = leaving && leaving.getBoundingClientRect();
   for (const v of ['unpaired', 'list', 'projects', 'quests', 'session', 'diff']) $(v).hidden = v !== view;
   $('back').hidden = DEPTH[view] === 0;
+  renderTabs();
+  renderStatus();
   if (leaving) slide(leaving, where, $(view), DEPTH[view] < DEPTH[from] ? 'back' : 'fwd');
 }
 
@@ -1818,25 +2031,30 @@ function settle() {
   }
 }
 
-function watch(id, way) {
-  const again = state.watching === id;
+// Opens a session on the PC that listed it. One session is watched at a
+// time over all the PCs, so watching on another PC stops the one before.
+function watch(id, way, L = here()) {
+  if (!L) return;
+  const again = state.watching === id && state.wlink === L;
   // A session started from the projects view takes that view's place in
   // history, so back goes to the session list.
   const swap = (state.watching && !again) || state.view === 'projects' || state.view === 'quests';
+  if (state.wlink && state.wlink !== L) send({ t: 'unwatch' }, state.wlink);
+  state.wlink = L;
   state.watching = id;
   state.screen = null;
   state.paused = false;
   if (!again) {
     state.changes = null;
     state.changesOpen = false;
-    const s = state.sessions.find((x) => x.id === id);
+    const s = L.sessions.find((x) => x.id === id);
     state.watchedPhase = s ? s.phase : null;
   }
   renderScreen.seen = false;
   show('session');
   renderTitle();
   renderScreen();
-  send({ t: 'watch', id });
+  send({ t: 'watch', id }, L);
   renderChanges();
   askChanges();
   if (way) swipeIn(way);
@@ -1845,47 +2063,22 @@ function watch(id, way) {
   else if (!again) history.pushState({ session: id }, '');
 }
 
-function unwatch() {
-  if (!state.watching) return;
+function clearWatch() {
+  state.wlink = null;
   state.watching = null;
   state.paused = false;
   state.screen = null;
   state.changes = null;
   state.diffPath = null;
   state.diff = null;
-  send({ t: 'unwatch' });
-  show('list');
-  renderTitle();
 }
 
-function choose(pc) {
-  closeSheet();
-  state.pc = pc;
-  state.sessions = [];
-  state.projects = [];
-  state.vapid = null;
-  state.warning = null;
-  state.starting = null;
-  state.watching = null;
-  state.tooOld = false;
-  state.folders = null;
-  state.changes = null;
-  state.diffPath = null;
-  state.diff = null;
-  state.quests = null;
-  state.adding = null;
-  state.added = null;
-  state.listed = false;
-  if (pc) localStorage.setItem('horadric.current', pc.id);
-  renderPcs();
+function unwatch() {
+  if (!state.watching) return;
+  send({ t: 'unwatch' }, state.wlink);
+  clearWatch();
+  show('list');
   renderTitle();
-  renderList();
-  show(pc ? 'list' : 'unpaired');
-  if (pc) connect();
-  else {
-    if (state.ws) state.ws.close();
-    $('status').hidden = true;
-  }
 }
 
 // Input
@@ -2135,32 +2328,35 @@ $('create').onsubmit = (ev) => {
     $('createhint').textContent = problem;
     return;
   }
-  if (state.starting || state.link !== 'online') return;
+  const L = here();
+  if (!L || L.starting || L.link !== 'online') return;
   $('pname').value = '';
   $('create').hidden = true;
-  startIn(root + sepOf(root) + name, { t: 'create', root, name });
-  state.starting.root = root;
+  startIn(root + sepOf(root) + name, { t: 'create', root, name }, L);
+  L.starting.root = root;
   renderFolders();
 };
 
-$('pcs').onchange = () => choose(loadPcs().find((p) => p.id === $('pcs').value) || null);
-
 $('forget').onclick = () => {
-  if (!state.pc || !confirm(`Forget ${state.pc.n}? You will need its pairing link again.`)) return;
-  const pcs = loadPcs().filter((p) => p.id !== state.pc.id);
-  savePcs(pcs);
-  choose(pcs[0] || null);
+  const L = tabLink();
+  if (!L || !confirm(`Forget ${L.pc.n}? You will need its pairing link again.`)) return;
+  savePcs(loadPcs().filter((p) => p.id !== L.pc.id));
+  try {
+    localStorage.setItem('horadric.tab', 'all');
+  } catch {}
+  refresh();
 };
 
 // On iOS a home screen app keeps storage of its own, and the camera opens
 // links only in the browser, so a pairing has to be carried over by hand.
 $('copylink').onclick = async () => {
-  if (!state.pc) return;
+  const L = tabLink();
+  if (!L) return;
   try {
-    await navigator.clipboard.writeText(linkFor(state.pc));
+    await navigator.clipboard.writeText(linkFor(L.pc));
     $('copylink').textContent = 'Copied. Paste it in the home screen app.';
   } catch {
-    prompt('Copy this pairing link:', linkFor(state.pc));
+    prompt('Copy this pairing link:', linkFor(L.pc));
   }
 };
 $('pasteform').onsubmit = (ev) => {
@@ -2216,35 +2412,41 @@ if (window.visualViewport) {
 
 // Start
 
+// The links and the page follow the paired PCs. A PC already connected
+// keeps its connection, so a notification's link on a page that is up
+// costs nothing.
+function refresh() {
+  syncLinks();
+  if (!state.links.length) {
+    closeSheet();
+    clearWatch();
+    show('unpaired');
+    return;
+  }
+  // The first time, nothing shows yet.
+  if (state.view === 'unpaired' || !refresh.shown) show('list');
+  refresh.shown = true;
+  pickTab(storedTab());
+}
+
 // A pairing link opened on a page that is already up only changes the
 // fragment, so take it then too.
 function pairFromLink() {
   takeFragment();
-  // A notification's link on a page already up keeps its connection.
-  if (state.open && state.pc) return openNow();
-  const pcs = loadPcs();
-  const current = localStorage.getItem('horadric.current');
-  choose(pcs.find((p) => p.id === current) || pcs[0] || null);
+  refresh();
   openFromPush();
 }
 
 // Shows the session a notification was about, on its PC when this phone
-// knows that PC. The watch goes out once connected, as after any hello.
+// knows that PC. The watch goes out once connected, as after any hello,
+// and a held answer at once when that PC has listed its sessions already.
 function openFromPush() {
   const open = state.open;
   state.open = null;
-  if (!open) return;
-  const pc = open.pc && loadPcs().find((p) => p.id === open.pc);
-  if (pc && (!state.pc || state.pc.id !== pc.id)) choose(pc);
-  if (state.pc) watch(open.id);
-}
-
-// On a page already up: show the session, and answer at once when this
-// PC's sessions are listed already, since no new list need come first.
-function openNow() {
-  const same = state.listed && (!state.open.pc || state.open.pc === state.pc.id);
-  openFromPush();
-  if (same) sendHeldAnswer();
+  if (!open || !state.links.length) return;
+  const L = (open.pc && linkOf(open.pc)) || state.links.find((x) => x.sessions.some((s) => s.id === open.id)) || here() || state.links[0];
+  watch(open.id, null, L);
+  if (L.listed) sendHeldAnswer(L);
 }
 window.addEventListener('hashchange', pairFromLink);
 pairFromLink();
@@ -2257,7 +2459,6 @@ if ('serviceWorker' in navigator) {
     if (d.t !== 'open' || typeof d.id !== 'string') return;
     state.open = { id: d.id, pc: typeof d.pc === 'string' ? d.pc : '' };
     if (d.answer) holdAnswer(state.open, d.answer);
-    if (state.pc) openNow();
-    else openFromPush();
+    openFromPush();
   });
 }
