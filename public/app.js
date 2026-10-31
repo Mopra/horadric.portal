@@ -1,12 +1,15 @@
 // The Town Portal page: the phone's side of docs/PORTAL.md. It talks to
 // the PC through the relay, and everything it says is encrypted with this
 // phone's own key, which lives only on the PC and in this browser. A PC
-// on Horadric 0.21 shares one key with every phone instead.
+// on Horadric 0.21 shares one key with every phone instead. A brotherhood
+// (v3) serves the phone from every brother, each with a key derived from
+// the phone's key pair and its own, see phonekey.js.
 'use strict';
 
 const VERSION = 2;
-// The PC versions this page speaks: 1 is Horadric 0.21.
-const SPEAKS = [1, 2];
+// The PC versions this page speaks: 1 is Horadric 0.21, 3 a brotherhood.
+const SPEAKS = [1, 2, 3];
+const helloV = (pc) => (pc.v === 3 ? 3 : VERSION);
 const $ = (id) => document.getElementById(id);
 
 // Pairing
@@ -186,6 +189,11 @@ function newLink(pc) {
     quests: null, // the PC's quests answer, null until it comes
     added: null, // { project, at } while an added quest is on its way
     sent: new Map(), // session id -> { label, since }: an inbox answer sent, until the phase moves
+    kp: null, // the key pair a pairing code is traded with
+    alt: null, // the derived key while a v2 PC upgrades, tried when the key in use opens nothing
+    brotherhood: false, // a v2 PC that said it could serve every brother's sessions
+    upgrade: null, // { kp, bkey, k } from "See every brother" until the PC switched
+    unreached: false, // a brother whose relay is up but that never answered hello
   };
 }
 
@@ -213,6 +221,7 @@ const state = {
   notesOpen: new Set(), // the quests whose notes show, by project and title
   sheet: null, // the long press menu, see openSheet
   replyWait: null, // { id, L, resolve, reject, timer } while a reply is asked for
+  told: new Map(), // brother id -> live | asleep | away, as the last brothers list said
 };
 
 const many = () => state.links.length > 1;
@@ -307,7 +316,15 @@ async function connect(L) {
     try {
       msg = await open(L.key, ev.data);
     } catch {
-      return;
+      if (!L.alt) return;
+      try {
+        msg = await open(L.alt, ev.data);
+      } catch {
+        return;
+      }
+      // The PC sealed with the other key, so it has switched: follow.
+      [L.key, L.alt] = [L.alt, L.key];
+      if (L.upgrade) upgraded(L);
     }
     onMessage(L, msg);
   };
@@ -402,12 +419,17 @@ function tell(L, text) {
 function greet(L) {
   L.s = null;
   L.greeted = false;
-  send({ t: 'hello', v: VERSION }, L);
+  send({ t: 'hello', v: helloV(L.pc) }, L);
   clearTimeout(L.answered);
-  L.answered = setTimeout(
-    () => tell(L, 'The PC does not answer this phone. It may have forgotten it: run horadric portal on the PC and pair again.'),
-    10000,
-  );
+  L.answered = setTimeout(() => {
+    // A brother another one named may not have heard the word that
+    // vouches for this phone yet, which is no reason to pair again.
+    if (L.pc.by && L.pc.by !== L.pc.id) {
+      L.unreached = true;
+      renderTabs();
+      renderNote();
+    } else tell(L, 'The PC does not answer this phone. It may have forgotten it: run horadric portal on the PC and pair again.');
+  }, 10000);
 }
 
 // Trades the one-time code for a key of this phone's own.
@@ -416,7 +438,13 @@ function pairNow(L) {
     codeFailed(L, 'This pairing code ran out. Run horadric portal on the PC for a new one.');
     return;
   }
-  send({ t: 'pair', v: VERSION, name: deviceName() }, L);
+  const at = L.pc.pk;
+  PhoneKey.current().then((kp) => {
+    // The code may have paid off or failed while the key pair was found.
+    if (L.pc.pk !== at) return;
+    L.kp = kp;
+    send(kp ? { t: 'pair', v: 3, name: deviceName(), key: kp.pub } : { t: 'pair', v: VERSION, name: deviceName() }, L);
+  });
 }
 
 // The code was used or ran out: forget it, and go on with the key this
@@ -434,17 +462,149 @@ function codeFailed(L, text, used) {
 
 async function paired(L, msg) {
   const pc = L.pc;
+  let k = msg.key;
+  // A brotherhood answers with its public key, and the key is derived
+  // from it; an older PC hands over a key of its own making.
+  const v3 = typeof msg.bkey === 'string' && typeof msg.brother === 'string' && L.kp;
   try {
-    L.key = await importKey(msg.key);
+    if (v3) k = PhoneKey.toB64url(await PhoneKey.derive(L.kp.privateKey, L.kp.pub, msg.bkey, msg.phone, msg.brother));
+    L.key = await importKey(k);
   } catch {
     return;
   }
-  pc.k = msg.key;
+  pc.k = k;
   pc.phone = msg.phone;
+  if (v3) Object.assign(pc, { v: 3, bkey: msg.bkey, kp: L.kp.id, band: pc.band || pc.id, by: pc.id });
   delete pc.pk;
   delete pc.x;
   savePc(pc);
   greet(L);
+}
+
+// The key with a brother whose public key is `bkey`, as b64url, or null
+// when this page has lost the key pair it paired with.
+async function derivedFor(pc, kpId, bkey) {
+  const kp = await PhoneKey.pairOf(kpId);
+  if (!kp || !pc.phone) return null;
+  try {
+    return PhoneKey.toB64url(await PhoneKey.derive(kp.privateKey, kp.pub, bkey, pc.phone, pc.id));
+  } catch {
+    return null;
+  }
+}
+
+// The brothers a brother names are served from then on, each by a socket
+// of its own. The list is trusted because it came sealed from a brother
+// this phone paired with, or one such a brother named.
+async function brothers(L, msg) {
+  if (!Array.isArray(msg.list)) return;
+  const list = msg.list.filter((b) => b && typeof b.id === 'string' && /^[0-9a-f]{32}$/.test(b.id));
+  for (const b of list) if (typeof b.state === 'string') state.told.set(b.id, b.state);
+  const me = list.find((b) => b.id === L.pc.id);
+  if (L.upgrade && me && typeof me.key === 'string') await upgradeKey(L, me.key);
+  if (L.pc.v !== 3) {
+    renderTabs();
+    return;
+  }
+  const band = L.pc.band || L.pc.id;
+  const pcs = loadPcs();
+  let changed = false;
+  for (const b of list) {
+    const known = pcs.find((p) => p.id === b.id);
+    if (known) {
+      // Two pairings that turn out to be one brotherhood are forgotten
+      // together.
+      if (known.v === 3 && known.band && known.band !== band) {
+        const was = known.band;
+        for (const p of pcs) if (p.band === was) p.band = band;
+        changed = true;
+      }
+      if (b.mark !== undefined && known.mark !== b.mark) {
+        known.mark = b.mark;
+        changed = true;
+      }
+      continue;
+    }
+    if (typeof b.key !== 'string') continue;
+    const name = typeof b.name === 'string' && b.name ? b.name : 'Brother';
+    const pc = { id: b.id, r: L.pc.r, n: name, phone: L.pc.phone, v: 3, bkey: b.key, kp: L.pc.kp, band, by: L.pc.id };
+    if (b.mark !== undefined) pc.mark = b.mark;
+    pc.k = await derivedFor(pc, L.pc.kp, b.key);
+    if (!pc.k) continue;
+    pcs.push(pc);
+    changed = true;
+  }
+  if (changed) {
+    savePcs(pcs);
+    refresh();
+  }
+  // A brother that had not heard of this phone may have by now.
+  for (const x of state.links) if (x.unreached && x.link === 'online') greet(x);
+  renderTabs();
+  renderNote();
+}
+
+// "See every brother" on a v2 PC that said it could: the PC vouches for
+// this phone's key pair as if it had just paired.
+async function upgrade(L) {
+  if (!L || L.upgrade || !L.greeted || !L.pc.phone) return;
+  const kp = await PhoneKey.current();
+  if (!kp) {
+    tell(L, 'This browser cannot keep a key pair, so this phone stays with this PC alone.');
+    return;
+  }
+  L.upgrade = { kp };
+  send({ t: 'upgrade', key: kp.pub }, L);
+  renderUpgrade();
+}
+
+// The PC's public key came back, in its answer to upgrade or in a
+// brothers list naming it. Both keys open its messages until one sealed
+// with the new key shows it switched, or at once when it says so.
+async function upgradeKey(L, bkey, now) {
+  const u = L.upgrade;
+  if (!u || u.bkey) return;
+  const k = await derivedFor(L.pc, u.kp.id, bkey);
+  if (!k || L.upgrade !== u) return;
+  u.bkey = bkey;
+  u.k = k;
+  L.alt = await importKey(k);
+  if (now) {
+    [L.key, L.alt] = [L.alt, L.key];
+    upgraded(L);
+  }
+}
+
+function upgraded(L) {
+  const u = L.upgrade;
+  if (!u || !u.k) return;
+  L.upgrade = null;
+  L.brotherhood = false;
+  Object.assign(L.pc, { k: u.k, v: 3, bkey: u.bkey, kp: u.kp.id, band: L.pc.band || L.pc.id, by: L.pc.id });
+  savePc(L.pc);
+  renderAll();
+}
+
+// Forgetting this phone on one brother forgets it on all: that brother
+// signs it for the phone and every brother drops it, so every tab of the
+// brotherhood goes here too.
+async function forgetPhone(L) {
+  const band = L.pc.band || L.pc.id;
+  const kin = state.links.filter((x) => x.pc.v === 3 && (x.pc.band || x.pc.id) === band);
+  const to = [L, ...kin].find((x) => x.greeted);
+  const ask = to
+    ? 'Forget this phone on every brother? You will need to pair again.'
+    : 'No brother is reached now, so they will know this phone until it is forgotten on a PC. Forget them here?';
+  if (!confirm(ask)) return;
+  if (to) await send({ t: 'forget' }, to);
+  const gone = new Set(kin.map((x) => x.pc.id));
+  const left = loadPcs().filter((p) => !gone.has(p.id));
+  savePcs(left);
+  for (const id of new Set(kin.map((x) => x.pc.kp).filter(Boolean))) PhoneKey.retire(id, left.some((p) => p.kp === id));
+  try {
+    localStorage.setItem('horadric.tab', 'all');
+  } catch {}
+  refresh();
 }
 
 // The PC forgot this phone, so its key is no good any more.
@@ -465,7 +625,15 @@ function onMessage(L, msg) {
   const watched = state.wlink === L;
   switch (msg.t) {
     case 'paired':
-      paired(L, msg);
+      // On a link already paired, the answer to upgrade.
+      if (L.upgrade && typeof msg.bkey === 'string') upgradeKey(L, msg.bkey, true);
+      else if (L.pc.pk) paired(L, msg);
+      break;
+    case 'upgraded':
+      if (L.upgrade && typeof msg.bkey === 'string') upgradeKey(L, msg.bkey, true);
+      break;
+    case 'brothers':
+      brothers(L, msg);
       break;
     case 'unpaired':
       unpaired(L);
@@ -475,6 +643,8 @@ function onMessage(L, msg) {
       L.s = typeof msg.s === 'string' ? msg.s : null;
       L.n = 0;
       L.greeted = true;
+      L.unreached = false;
+      L.brotherhood = msg.brotherhood === true && L.pc.v !== 3;
       if (watched && state.watching) {
         send({ t: 'watch', id: state.watching }, L);
         askChanges();
@@ -490,6 +660,7 @@ function onMessage(L, msg) {
       renderNote();
       renderTitle();
       renderPush();
+      renderUpgrade();
       resendPush(L);
       if (here() === L && state.view === 'projects') askFolders();
       if (here() === L && state.view === 'quests') askQuests();
@@ -612,6 +783,7 @@ const phaseOf = (s) => (PHASES.includes(s.phase) ? s.phase : 'idle');
 function noteOf(L) {
   if (L.warning) return L.warning;
   if (L.tooOld) return 'This PC runs a Horadric this page does not speak. Update Horadric on the PC.';
+  if (L.unreached) return `${L.pc.n} has not heard of this phone yet. It will once word from the brother this phone paired with reaches it.`;
   if (L.link === 'pcoff') return `${L.pc.n} is not connected. Is Horadric running, with horadric portal on?`;
   if (L.link === 'offline') return 'Cannot reach the relay. Retrying.';
   return '';
@@ -705,8 +877,9 @@ function renderTabs() {
         b.type = 'button';
         b.dataset.id = t.id;
         b.setAttribute('role', 'tab');
-        if (t.L) b.append(el('i', 'lamp'));
+        if (t.L) b.append(el('i', 'lamp'), el('b', 'mark'));
         b.append(el('span'));
+        if (t.L) b.append(el('small'));
         b.onclick = () => pickTab(t.id);
         return b;
       }),
@@ -717,13 +890,36 @@ function renderTabs() {
     const on = state.tab === t.id;
     b.classList.toggle('on', on);
     b.setAttribute('aria-selected', String(on));
-    b.lastChild.textContent = t.label;
+    b.querySelector('span').textContent = t.label;
     if (t.L) {
-      const live = t.L.link === 'online' && t.L.greeted;
-      b.firstChild.className = 'lamp' + (live ? ' online' : '');
-      b.title = live ? `${t.label} is online` : `${t.label} is not reached`;
+      const [dot, words] = tabState(t.L);
+      b.querySelector('.lamp').className = 'lamp' + (dot ? ' ' + dot : '');
+      b.title = `${t.label}: ${words}`;
+      b.querySelector('small').textContent = t.L.unreached ? 'not reached yet' : '';
+      markOn(b.querySelector('.mark'), t.L.pc.mark);
     }
   });
+}
+
+// Green once this phone is answered, else what the brothers last said of
+// it: amber asleep, grey out of reach. A brother whose relay is up but
+// that never answers has not heard of this phone yet.
+function tabState(L) {
+  if (L.link === 'online' && L.greeted) return ['online', 'online'];
+  if (L.unreached) return ['', 'has not heard of this phone yet'];
+  if (state.told.get(L.pc.id) === 'asleep') return ['asleep', 'asleep'];
+  return ['', 'not reached'];
+}
+
+// A brother's mark as the PC draws it on its tiles: a colour, or a short
+// sign. Anything else is left out rather than guessed at.
+function markOn(m, mark) {
+  const colour = typeof mark === 'number' ? hex(mark) : typeof mark === 'string' && /^#[0-9a-f]{6}$/i.test(mark) ? mark : null;
+  const sign = !colour && typeof mark === 'string' && mark.length <= 2 ? mark : '';
+  m.hidden = !colour && !sign;
+  m.style.background = colour || '';
+  m.classList.toggle('swatch', !!colour);
+  m.textContent = sign;
 }
 
 function pickTab(id) {
@@ -751,6 +947,7 @@ function renderAll() {
   $('listtools').hidden = !L;
   $('copylink').hidden = !L;
   $('forget').hidden = !L;
+  $('forget').textContent = L && L.pc.v === 3 ? 'Forget this phone' : 'Forget this PC';
   $('empty').textContent = L ? 'No sessions on this PC.' : 'No sessions.';
   renderTabs();
   renderStatus();
@@ -758,6 +955,7 @@ function renderAll() {
   renderTitle();
   renderList();
   renderPush();
+  renderUpgrade();
 }
 
 const baseName = (p) => String(p).split(/[\\/]/).filter(Boolean).pop() || String(p);
@@ -1317,6 +1515,15 @@ function renderPush() {
   b.hidden = !button;
   hint.hidden = !text;
   hint.textContent = text || '';
+}
+
+// A v2 PC that serves a brotherhood offers every brother, with no new scan.
+function renderUpgrade() {
+  const L = tabLink();
+  const b = $('upgrade');
+  b.hidden = !L || !(L.brotherhood || L.upgrade) || !L.pc.phone;
+  b.disabled = !!(L && L.upgrade);
+  b.textContent = L && L.upgrade ? 'Asking the PC...' : 'See every brother';
 }
 
 async function subscription(create, vapid) {
@@ -2337,8 +2544,13 @@ $('create').onsubmit = (ev) => {
   renderFolders();
 };
 
+$('upgrade').onclick = () => upgrade(tabLink());
 $('forget').onclick = () => {
   const L = tabLink();
+  if (L && L.pc.v === 3) {
+    forgetPhone(L);
+    return;
+  }
   if (!L || !confirm(`Forget ${L.pc.n}? You will need its pairing link again.`)) return;
   savePcs(loadPcs().filter((p) => p.id !== L.pc.id));
   try {
