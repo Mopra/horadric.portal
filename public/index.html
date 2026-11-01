@@ -30,6 +30,7 @@
     <li>Scan the code it shows with this phone, or open the link it prints.</li>
     <li>Add this page to your home screen.</li>
   </ol>
+  <p class="or"><button id="signin" class="pill">Sign in</button><span class="dim">Signed in on the PC too? Sign in here and the PC lets this phone in, no code to scan.</span></p>
   <form id="pasteform" class="paste">
     <input id="pastelink" type="url" placeholder="Or paste a pairing link" autocomplete="off" autocapitalize="off" spellcheck="false">
     <button type="submit" class="pill">Pair</button>
@@ -37,6 +38,18 @@
   <p id="pastehint" class="dim"></p>
   <p class="dim">On an iPhone the home screen app does not share the browser's pairing. Pair in the browser, tap Copy pairing link there, and paste it here.</p>
   <p class="dim">The key stays in the link and on this phone. The relay passes encrypted frames and cannot read them.</p>
+</main>
+
+<main id="asking" class="view" hidden>
+  <h1>Town Portal</h1>
+  <p id="askwho" class="dim"></p>
+  <p id="asktext"></p>
+  <div id="askmachines"></div>
+  <div id="askcode" class="askcode" hidden></div>
+  <div id="askyesno" class="askyesno" hidden><button id="askyes" class="pill">Yes</button><button id="askno" class="pill">No</button></div>
+  <button id="asklook" class="pill" hidden>Look again</button>
+  <button id="askagain" class="pill" hidden>Sign in again</button>
+  <button id="askcancel" class="link">Cancel</button>
 </main>
 
 <main id="list" class="view" hidden>
@@ -50,6 +63,7 @@
     <p id="notifyhint" class="dim" hidden></p>
     <button id="upgrade" class="pill" hidden>See every brother</button>
     <button id="copylink" class="link">Copy pairing link</button>
+    <button id="signinmore" class="link">Pair another PC by signing in</button>
     <button id="forget" class="link">Forget this PC</button>
   </footer>
 </main>
@@ -121,6 +135,7 @@
 </div>
 
 <script src="/phonekey.js"></script>
+<script src="/ask.js"></script>
 <script src="/app.js"></script>
 </body>
 </html>

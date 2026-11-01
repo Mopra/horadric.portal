@@ -1,7 +1,7 @@
 // Keeps the page openable without a network, and always prefers a fresh
 // copy when there is one, so an update reaches the phone at once.
-const CACHE = 'horadric-portal-v21';
-const SHELL = ['/', '/index.html', '/app.js', '/phonekey.js', '/style.css', '/manifest.webmanifest', '/icon.png', '/icon-256.png'];
+const CACHE = 'horadric-portal-v22';
+const SHELL = ['/', '/index.html', '/app.js', '/phonekey.js', '/ask.js', '/style.css', '/manifest.webmanifest', '/icon.png', '/icon-256.png'];
 
 self.addEventListener('install', (ev) => {
   ev.waitUntil(caches.open(CACHE).then((c) => c.addAll(SHELL)).then(() => self.skipWaiting()));
@@ -18,7 +18,11 @@ self.addEventListener('activate', (ev) => {
 
 self.addEventListener('fetch', (ev) => {
   const req = ev.request;
-  if (req.method !== 'GET' || new URL(req.url).origin !== location.origin) return;
+  const url = new URL(req.url);
+  if (req.method !== 'GET' || url.origin !== location.origin) return;
+  // The way back from signing in carries a login code, which no cache
+  // may keep.
+  if (url.searchParams.has('code')) return;
   ev.respondWith(
     fetch(req)
       .then((res) => {

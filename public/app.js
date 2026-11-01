@@ -256,7 +256,7 @@ function setLink(L, link) {
 
 function renderStatus() {
   const L = here();
-  $('status').hidden = !L || state.view === 'unpaired';
+  $('status').hidden = !L || state.view === 'unpaired' || state.view === 'asking';
   if (!L) return;
   const lamp = $('status').querySelector('.lamp');
   const label = $('status').querySelector('span');
@@ -846,6 +846,8 @@ function renderTitle() {
     $('title').textContent = 'Open project';
   } else if (state.view === 'quests') {
     $('title').textContent = 'Quests';
+  } else if (state.view === 'asking') {
+    $('title').textContent = 'Horadric';
   } else {
     const L = tabLink();
     const n = waitingList().length;
@@ -2193,7 +2195,9 @@ $('screenwrap').addEventListener('touchend', (ev) => {
 
 // How deep a view sits, so going deeper slides in from the right and back
 // slides the other way.
-const DEPTH = { unpaired: 0, list: 0, projects: 1, quests: 1, session: 1, diff: 2 };
+// Asking has no back: it may be the first page after WorkOS's, and back
+// would go there. It has a Cancel of its own.
+const DEPTH = { unpaired: 0, asking: 0, list: 0, projects: 1, quests: 1, session: 1, diff: 2 };
 const still = matchMedia('(prefers-reduced-motion: reduce)');
 
 function show(view) {
@@ -2202,7 +2206,7 @@ function show(view) {
   const leaving = from !== view && !$(from).hidden ? $(from) : null;
   // Measured while it still shows, since hidden it has no size.
   const where = leaving && leaving.getBoundingClientRect();
-  for (const v of ['unpaired', 'list', 'projects', 'quests', 'session', 'diff']) $(v).hidden = v !== view;
+  for (const v of ['unpaired', 'asking', 'list', 'projects', 'quests', 'session', 'diff']) $(v).hidden = v !== view;
   $('back').hidden = DEPTH[view] === 0;
   renderTabs();
   renderStatus();
@@ -2571,6 +2575,13 @@ $('copylink').onclick = async () => {
     prompt('Copy this pairing link:', linkFor(L.pc));
   }
 };
+$('signin').onclick = Ask.begin;
+$('signinmore').onclick = Ask.begin;
+$('askyes').onclick = Ask.yes;
+$('askno').onclick = Ask.no;
+$('asklook').onclick = Ask.look;
+$('askagain').onclick = Ask.begin;
+$('askcancel').onclick = Ask.cancel;
 $('pasteform').onsubmit = (ev) => {
   ev.preventDefault();
   if (!pairWith($('pastelink').value.trim())) {
@@ -2629,6 +2640,9 @@ if (window.visualViewport) {
 // costs nothing.
 function refresh() {
   syncLinks();
+  // A brothers list may add PCs while the phone signs in; the ask keeps
+  // the screen until it is over.
+  if (Ask.busy()) return;
   if (!state.links.length) {
     closeSheet();
     clearWatch();
@@ -2636,7 +2650,7 @@ function refresh() {
     return;
   }
   // The first time, nothing shows yet.
-  if (state.view === 'unpaired' || !refresh.shown) show('list');
+  if (state.view === 'unpaired' || state.view === 'asking' || !refresh.shown) show('list');
   refresh.shown = true;
   pickTab(storedTab());
 }
@@ -2662,6 +2676,7 @@ function openFromPush() {
 }
 window.addEventListener('hashchange', pairFromLink);
 pairFromLink();
+Ask.start();
 
 if ('serviceWorker' in navigator) {
   navigator.serviceWorker.register('/sw.js').catch(() => {});

@@ -4,6 +4,10 @@
 // and makes projects, adds quests, takes photos, renames and stops
 // sessions, answers their last reply, echoes what the phone types into
 // the watched session's screen, and streams output into the working one.
+// With FAKE_TOKEN (test/fakerelay.js takes "fake:user_fake") it dials
+// signed in and with asks=1, and lets a phone in that signs in (Pairing
+// v4): it prints the code and says yes after 4 seconds, or no with
+// FAKE_ASK=no.
 'use strict';
 const crypto = require('crypto');
 const os = require('os');
@@ -21,18 +25,96 @@ const name = 'Fake ' + os.hostname();
 console.log(`pair: ${page}/#r=${encodeURIComponent(relay)}&id=${id}&k=${keyB64}&n=${encodeURIComponent(name)}`);
 console.log(`qr:   ${page}/pair.html#r=${encodeURIComponent(relay)}&id=${id}&k=${keyB64}&n=${encodeURIComponent(name)}`);
 
-function seal(obj) {
+// The phones let in by signing in each have a key of their own; a
+// channel is answered with the key that opened its frames.
+const keys = [key];
+const chKey = new Map();
+
+function seal(obj, k) {
   const nonce = crypto.randomBytes(12);
-  const c = crypto.createCipheriv('aes-256-gcm', key, nonce);
+  const c = crypto.createCipheriv('aes-256-gcm', k || key, nonce);
   const body = Buffer.concat([c.update(JSON.stringify(obj), 'utf8'), c.final(), c.getAuthTag()]);
   return Buffer.concat([nonce, body]);
 }
-function open(buf) {
+function openWith(k, buf) {
   const nonce = buf.subarray(0, 12);
   const tag = buf.subarray(buf.length - 16);
-  const d = crypto.createDecipheriv('aes-256-gcm', key, nonce);
+  const d = crypto.createDecipheriv('aes-256-gcm', k, nonce);
   d.setAuthTag(tag);
   return JSON.parse(Buffer.concat([d.update(buf.subarray(12, buf.length - 16)), d.final()]).toString('utf8'));
+}
+function open(buf, ch) {
+  for (const k of keys) {
+    try {
+      const m = openWith(k, buf);
+      chKey.set(ch, k);
+      return m;
+    } catch {}
+  }
+  throw new Error('no key opens it');
+}
+
+// Pairing v4, the PC's side, as docs/PORTAL.md has it.
+const token = process.env.FAKE_TOKEN || '';
+const me = crypto.createECDH('prime256v1');
+me.generateKeys();
+const myPub = me.getPublicKey();
+const signins = new Map(); // ch -> { email, step, name, commit, nonce }
+function derive(label, parts) {
+  const h = crypto.createHash('sha256').update(label, 'utf8');
+  for (const p of parts) {
+    const n = Buffer.alloc(4);
+    n.writeUInt32BE(p.length);
+    h.update(n).update(p);
+  }
+  return h.digest();
+}
+const b64 = (u) => Buffer.from(u).toString('base64url');
+function onAsk(ch, payload) {
+  const a = signins.get(ch);
+  const plain = (obj) => ws.send(R.frame(ch, Buffer.from(JSON.stringify(obj))));
+  const refuse = (why) => {
+    console.log(`ask ${ch} refused: ${why}`);
+    plain({ t: 'refused' });
+    signins.delete(ch);
+    ws.send(JSON.stringify({ close: ch }));
+  };
+  let m;
+  try {
+    m = JSON.parse(payload.toString('utf8'));
+  } catch {
+    return refuse('not JSON');
+  }
+  console.log('ask', ch, m);
+  if (m.t === 'refused') return signins.delete(ch);
+  if (a.step === 'ask' && m.t === 'ask' && m.v === 1 && typeof m.commit === 'string') {
+    Object.assign(a, { step: 'reveal', name: String(m.name || 'Phone'), commit: m.commit, nonce: crypto.randomBytes(16) });
+    return plain({ t: 'asking', v: 1, name, brother: id, pub: b64(myPub), nonce: b64(a.nonce) });
+  }
+  if (a.step === 'reveal' && m.t === 'reveal') {
+    const pub = Buffer.from(String(m.pub), 'base64url');
+    const nonce = Buffer.from(String(m.nonce), 'base64url');
+    if (b64(derive('horadric ask commit v1', [pub, nonce])) !== a.commit || pub.equals(myPub)) return refuse('commit');
+    const s = me.computeSecret(pub);
+    const parts = [s, pub, nonce, myPub, a.nonce];
+    const n = derive('horadric ask code v1', parts).readUInt32BE(0) % 1000000;
+    const code = String(n).padStart(6, '0').replace(/^(...)/, '$1 ');
+    const askKey = derive('horadric ask key v1', parts);
+    a.step = 'human';
+    const yes = process.env.FAKE_ASK !== 'no';
+    console.log(`${a.name} wants to use Town Portal, signed in as ${a.email}. Does the phone show ${code}? Saying ${yes ? 'yes' : 'no'} in 4 s.`);
+    setTimeout(() => {
+      if (signins.get(ch) !== a) return;
+      if (!yes) return refuse('the human said no');
+      const phone = crypto.randomBytes(8).toString('base64url');
+      keys.push(derive('horadric phone key v1', [s, pub, myPub, Buffer.from(phone), Buffer.from(id)]));
+      ws.send(R.frame(ch, seal({ t: 'paired', phone, brother: id, bkey: b64(myPub) }, askKey)));
+      signins.delete(ch);
+      console.log(`paired ${a.name} as ${phone}`);
+    }, 4000);
+    return;
+  }
+  refuse('out of order');
 }
 
 // The VAPID key pair a real PC keeps in portal.json, made fresh here.
@@ -164,7 +246,9 @@ const questsMessage = () => ({ t: 'quests', list: logs });
 
 let ws;
 function start() {
-  ws = new WebSocket(`${relay}/pc`, { headers: { 'X-Horadric-Secret': secret } });
+  const headers = { 'X-Horadric-Secret': secret };
+  if (token) headers.Authorization = `Bearer ${token}`;
+  ws = new WebSocket(`${relay}/pc?${new URLSearchParams(token ? { name, asks: '1' } : { name })}`, { headers });
   ws.on('open', () => console.log('connected as', id));
   ws.on('message', (data, isBinary) => {
     if (!isBinary) {
@@ -172,21 +256,24 @@ function start() {
       heard = Date.now();
       if (m.pong) return;
       console.log('relay:', m);
+      if (Number.isInteger(m.ask)) signins.set(m.ask, { email: m.email, step: 'ask' });
       if (m.close) {
+        signins.delete(m.close);
         watching.delete(m.close);
         questsTo.delete(m.close);
       }
       return;
     }
     const f = R.unframe(data);
+    if (signins.has(f.ch)) return onAsk(f.ch, f.payload);
     let msg;
     try {
-      msg = open(f.payload);
+      msg = open(f.payload, f.ch);
     } catch {
       return console.log('dropped a frame that did not decrypt');
     }
     console.log('ch', f.ch, msg);
-    const reply = (obj) => ws.send(R.frame(f.ch, seal(obj)));
+    const reply = (obj) => ws.send(R.frame(f.ch, seal(obj, chKey.get(f.ch))));
     if (msg.t === 'hello') {
       reply({ t: 'hello', v: 1, pc: name, vapid: vapidRaw });
       reply({ t: 'sessions', list: sessions });
@@ -242,7 +329,7 @@ function start() {
       const notes = String(msg.notes || '').split('\n').map((l) => l.trim()).filter(Boolean);
       log.quests.push({ title, state: 'open', session: null, why: '', notes });
       reply({ t: 'quest_added', project: log.project, title });
-      for (const ch of questsTo) ws.send(R.frame(ch, seal(questsMessage())));
+      for (const ch of questsTo) ws.send(R.frame(ch, seal(questsMessage(), chKey.get(ch))));
     } else if (msg.t === 'rename') {
       const s = sessions.find((x) => x.id === msg.id);
       if (!s) return reply({ t: 'error', text: 'That session is gone.' });
@@ -321,8 +408,8 @@ async function push() {
 
 function sendScreen(ch, sid) {
   const lines = screens[sid];
-  if (!lines) return ws.send(R.frame(ch, seal({ t: 'error', text: 'No such session' })));
-  ws.send(R.frame(ch, seal({ t: 'screen', id: sid, cols: 100, rows: 30, lines, cursor: [lines.length - 1, lines[lines.length - 1].length] })));
+  if (!lines) return ws.send(R.frame(ch, seal({ t: 'error', text: 'No such session' }, chKey.get(ch))));
+  ws.send(R.frame(ch, seal({ t: 'screen', id: sid, cols: 100, rows: 30, lines, cursor: [lines.length - 1, lines[lines.length - 1].length] }, chKey.get(ch))));
 }
 
 // The working session prints a line every half second, and its oldest

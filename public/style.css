@@ -126,6 +126,26 @@ code { font-family: ui-monospace, "Cascadia Mono", Menlo, monospace; color: var(
 #unpaired { padding: 24px; }
 #unpaired h1 { font-family: Georgia, serif; color: var(--gold); font-weight: normal; }
 #unpaired li { margin: 8px 0; }
+#unpaired .or { display: flex; align-items: center; gap: 12px; margin-top: 20px; }
+#unpaired .or .pill { margin: 0; }
+#unpaired .or .dim { font-size: 13px; }
+
+/* Pairing by signing in */
+#asking { padding: 24px; }
+#asking h1 { font-family: Georgia, serif; color: var(--gold); font-weight: normal; }
+#askwho { font-size: 13px; }
+#askmachines .sess .what { font-weight: 600; }
+.askcode {
+  margin: 24px 0;
+  text-align: center;
+  font: 40px/1 ui-monospace, Menlo, Consolas, monospace;
+  letter-spacing: 0.08em;
+  color: var(--gold);
+}
+.askyesno { display: flex; gap: 12px; justify-content: center; margin-bottom: 12px; }
+.askyesno .pill { min-width: 96px; margin: 0; }
+#asking > .pill { display: block; margin: 12px 0; }
+#asking > .link { display: block; margin: 20px 0 0; padding: 0; }
 .dim { color: var(--dim); }
 .center { text-align: center; padding: 32px; }
 

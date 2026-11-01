@@ -118,6 +118,26 @@ function parseControl(data) {
   return null;
 }
 
+// Text from a phone on /ask: a ping, its sign in code with the PKCE
+// verifier, a fresh list or the PC it asks. Anything else is dropped.
+function parseAsk(data) {
+  if (!data || data.length > MAX_CONTROL) return null;
+  let m;
+  try {
+    m = JSON.parse(data.toString());
+  } catch {
+    return null;
+  }
+  if (!m || typeof m !== 'object') return null;
+  if (m.ping === 1) return { ping: true };
+  if (typeof m.code === 'string' && m.code && m.code.length <= 2048 && /^[A-Za-z0-9_-]{43,128}$/.test(m.verifier)) {
+    return { code: m.code, verifier: m.verifier };
+  }
+  if (m.list === 1) return { list: true };
+  if (isId(m.ask)) return { ask: m.ask };
+  return null;
+}
+
 // When the relay closes a signed in socket whose token ran out (ms), given
 // its token's exp (s) and whether it is exempt (see exempt below): one that
 // is, a 0.34 or older machine, is let be until QUERY_UNTIL, the day those
@@ -303,6 +323,7 @@ module.exports = {
   cleanName,
   brothersOf,
   parseControl,
+  parseAsk,
   isId,
   isSecret,
 };

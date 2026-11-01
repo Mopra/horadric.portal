@@ -31,6 +31,41 @@ const CLOSE_AUTH_DOWN = 4503;
 // The user has as many machines connected as the relay serves one.
 const CLOSE_TOO_MANY = 4429;
 
+// A phone signing in on /ask: so long to hand over a code that WorkOS
+// takes, and so long in all, whatever it is doing (PORTAL.md, "Pairing v4").
+const ASK_SIGN_IN = 30 * 1000;
+const ASK_LIFE = 5 * 60 * 1000;
+// Sign ins one address may hold open at once, so a host cannot make the
+// relay spend WorkOS calls on code after made up code.
+const MAX_ASKS_PER_IP = 16;
+const WORKOS_AUTHORIZE = 'https://api.workos.com/user_management/authorize';
+const WORKOS_AUTHENTICATE = 'https://api.workos.com/user_management/authenticate';
+
+// WorkOS's answer to a code, or an AuthError: retry when it could not be
+// asked, else what it said was wrong.
+async function postWorkos(url, body) {
+  let res;
+  try {
+    res = await fetch(url, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(10000),
+    });
+  } catch {
+    throw new AuthError('cannot reach WorkOS', true);
+  }
+  const json = await res.json().catch(() => null);
+  if (!res.ok) {
+    const why = json && (json.error_description || json.message || json.error);
+    throw new AuthError(typeof why === 'string' && why ? why : `WorkOS said ${res.status}`, res.status >= 500);
+  }
+  return json;
+}
+
+// A PKCE challenge or a state as the page makes them: b64url, no padding.
+const isB64url = (s, min, max) => typeof s === 'string' && s.length >= min && s.length <= max && /^[A-Za-z0-9_-]+$/.test(s);
+
 const sendText = (ws, obj) => ws && ws.readyState === 1 && ws.send(JSON.stringify(obj));
 
 function reject(socket, code) {
@@ -99,6 +134,8 @@ function writeDurably(file, text) {
 
 // options.verify(token) resolves to the token's claims; tests pass their own.
 // options.stateFile is where the first-seen map is kept; without it, memory only.
+// options.workosFetch(url, body) posts to WorkOS and resolves to its JSON,
+// as auth.js takes fetchJwks, so tests never reach the network.
 function createRelay(options = {}) {
   const trustProxy = options.trustProxy ?? process.env.TRUST_PROXY === '1';
   const now = options.now || Date.now;
@@ -108,7 +145,18 @@ function createRelay(options = {}) {
       issuers: process.env.WORKOS_ISSUER ? process.env.WORKOS_ISSUER.split(',') : undefined,
     });
 
-  // id -> { id, pc, phones: Map<ch, ws>, links: Map<ch, { peer, ch }>, last, user, name }
+  const env = process.env;
+  const pageClient = options.pageClient ?? (env.WORKOS_PAGE_CLIENT_ID || (env.WORKOS_CLIENT_ID || '').split(',').filter(Boolean)[0] || '');
+  const origin = (options.origin ?? (env.PUBLIC_ORIGIN || 'https://portal.horadric.dev')).replace(/\/+$/, '');
+  const apiKey = options.apiKey ?? env.WORKOS_API_KEY ?? '';
+  const workosFetch = options.workosFetch || postWorkos;
+  const askSignIn = options.askSignIn ?? ASK_SIGN_IN;
+  const askLife = options.askLife ?? ASK_LIFE;
+  // test/fakerelay.js points this at a sign in of its own.
+  const authorizeUrl = options.authorizeUrl || WORKOS_AUTHORIZE;
+
+  // id -> { id, pc, phones: Map<ch, ws>, links: Map<ch, { peer, ch }>,
+  // asks: Map<ch, ask>, takesAsks, last, user, name }
   const rooms = new Map();
   // WorkOS user (sub) -> Set of ids of that user's connected PCs.
   const users = new Map();
@@ -208,6 +256,7 @@ function createRelay(options = {}) {
 
   function serveStatic(req, res) {
     const url = new URL(req.url, 'http://x');
+    if (url.pathname === '/signin') return signIn(url, res);
     if (url.pathname === '/health') {
       res.writeHead(200, { 'content-type': 'text/plain' });
       return res.end(`ok ${rooms.size}\n`);
@@ -241,10 +290,37 @@ function createRelay(options = {}) {
     });
   }
 
+  // The page's way to WorkOS: the relay holds the client id and the
+  // origin WorkOS sends the browser back to, the page its own PKCE
+  // challenge and state, so nothing secret passes here.
+  function signIn(url, res) {
+    const challenge = url.searchParams.get('challenge');
+    const state = url.searchParams.get('state');
+    if (!isB64url(challenge, 43, 128) || !isB64url(state, 16, 128)) {
+      res.writeHead(400, { 'content-type': 'text/plain' });
+      return res.end('bad challenge or state\n');
+    }
+    if (!pageClient) {
+      res.writeHead(503, { 'content-type': 'text/plain' });
+      return res.end('sign in is not set up on this relay\n');
+    }
+    const q = new URLSearchParams({
+      client_id: pageClient,
+      redirect_uri: `${origin}/`,
+      response_type: 'code',
+      provider: 'authkit',
+      code_challenge: challenge,
+      code_challenge_method: 'S256',
+      state,
+    });
+    res.writeHead(302, { location: `${authorizeUrl}?${q}`, 'cache-control': 'no-store', 'referrer-policy': 'no-referrer' });
+    res.end();
+  }
+
   function room(id) {
     let r = rooms.get(id);
     if (!r) {
-      r = { id, pc: null, phones: new Map(), links: new Map(), last: 0, user: null, name: 'PC' };
+      r = { id, pc: null, phones: new Map(), links: new Map(), asks: new Map(), takesAsks: false, last: 0, user: null, name: 'PC' };
       rooms.set(id, r);
     }
     return r;
@@ -252,12 +328,12 @@ function createRelay(options = {}) {
 
   function dropIfEmpty(id) {
     const r = rooms.get(id);
-    if (r && !r.pc && r.phones.size === 0) rooms.delete(id);
+    if (r && !r.pc && r.phones.size === 0 && r.asks.size === 0) rooms.delete(id);
   }
 
   // Phone and brother channels share one number space per PC, so a frame's
   // channel always says which of the two it is.
-  const taken = (r) => ({ has: (ch) => r.phones.has(ch) || r.links.has(ch) });
+  const taken = (r) => ({ has: (ch) => r.phones.has(ch) || r.links.has(ch) || r.asks.has(ch) });
 
   function tellBrothers(sub) {
     const ids = users.get(sub);
@@ -352,17 +428,20 @@ function createRelay(options = {}) {
     }
   }
 
-  function onPc(ws, id, user, name, auth) {
+  function onPc(ws, id, user, name, auth, takesAsks = false) {
     const r = room(id);
     // A second connection with the same id is the PC reconnecting. Its
-    // brother channels die with the old socket, as phone sessions would.
+    // brother channels die with the old socket, as phone sessions would,
+    // and so do its asks, whose handshake lived in the old one.
     if (r.pc) {
       closeLinks(r);
+      dropAsks(r);
       r.pc.terminate();
     }
     if (r.user !== user) leaveUser(r);
     r.pc = ws;
     r.name = name;
+    r.takesAsks = takesAsks;
     alive(ws);
     for (const [ch, phone] of r.phones) {
       sendText(phone, { relay: 'online' });
@@ -383,6 +462,7 @@ function createRelay(options = {}) {
         if (m.ping) return sendText(ws, { pong: 1 });
         if (r.pc !== ws) return;
         if (m.join) return join(r, m.join);
+        if (m.close && r.asks.has(m.close)) return unlinkAsk(r.asks.get(m.close));
         if (m.close) return closeLink(r, m.close);
         // Never passed on, and only a socket that came signed in has a
         // token to replace.
@@ -393,6 +473,11 @@ function createRelay(options = {}) {
       if (!f || !fits(f.payload, 'pc', id)) return;
       if (f.ch === R.BROADCAST) {
         for (const phone of r.phones.values()) if (phone.readyState === 1) phone.send(f.payload);
+        return;
+      }
+      const ask = r.asks.get(f.ch);
+      if (ask) {
+        if (r.pc === ws && ask.ws.readyState === 1) ask.ws.send(f.payload);
         return;
       }
       const l = r.links.get(f.ch);
@@ -414,6 +499,7 @@ function createRelay(options = {}) {
   function detach(r) {
     r.pc = null;
     closeLinks(r);
+    dropAsks(r);
     leaveUser(r);
     for (const phone of r.phones.values()) sendText(phone, { relay: 'offline' });
     dropIfEmpty(r.id);
@@ -437,6 +523,115 @@ function createRelay(options = {}) {
       r.phones.delete(ch);
       if (r.pc) sendText(r.pc, { close: ch });
       dropIfEmpty(id);
+    });
+    ws.on('error', () => {});
+  }
+
+  // Signing in: the phone's code is traded with WorkOS, the token it gives
+  // is checked as a PC's is, and the phone may then ask one of its user's
+  // PCs that take asks. The relay finds the PCs; what the PC trusts is its
+  // human's yes after comparing a code, which the relay cannot fake.
+  const askIps = new Map();
+
+  function machinesOf(sub) {
+    const ids = users.get(sub) || new Set();
+    const pcs = [...ids].map((id) => rooms.get(id)).filter((r) => r && r.pc && r.user === sub && r.takesAsks);
+    return R.brothersOf(pcs, null);
+  }
+
+  // The ask channel goes, and its PC is told, as when a phone leaves.
+  function closeAsk(a) {
+    const r = a.r;
+    if (!r) return;
+    const ch = a.ch;
+    unlinkAsk(a);
+    sendText(r.pc, { close: ch });
+  }
+
+  function unlinkAsk(a) {
+    const r = a.r;
+    if (!r) return;
+    r.asks.delete(a.ch);
+    a.r = null;
+    a.ch = 0;
+    dropIfEmpty(r.id);
+  }
+
+  // The PC went, so every ask on it is over; the phone may ask another.
+  function dropAsks(r) {
+    for (const a of [...r.asks.values()]) {
+      unlinkAsk(a);
+      sendText(a.ws, { relay: 'offline' });
+    }
+  }
+
+  function openAsk(a, id) {
+    const r = rooms.get(id);
+    if (!r || !r.pc || r.user !== a.sub || !r.takesAsks) return sendText(a.ws, { error: 'no such machine' });
+    closeAsk(a);
+    if (r.asks.size >= R.MAX_PHONES) return sendText(a.ws, { error: 'too many asks' });
+    const ch = R.nextChannel(r.last, taken(r));
+    r.last = ch;
+    r.asks.set(ch, a);
+    a.r = r;
+    a.ch = ch;
+    sendText(r.pc, { ask: ch, email: a.email });
+  }
+
+  async function exchange(code, verifier) {
+    if (!pageClient) throw new AuthError('sign in is not set up on this relay', true);
+    const body = { client_id: pageClient, grant_type: 'authorization_code', code, code_verifier: verifier };
+    if (apiKey) body.client_secret = apiKey;
+    const got = await workosFetch(WORKOS_AUTHENTICATE, body);
+    if (!got || typeof got.access_token !== 'string') throw new AuthError('WorkOS gave no token');
+    const claims = await verify(got.access_token);
+    const email = got.user && typeof got.user.email === 'string' ? got.user.email : '';
+    return { sub: claims.sub, email };
+  }
+
+  function onAsk(ws, release) {
+    const a = { ws, sub: null, email: '', checking: false, r: null, ch: 0 };
+    alive(ws);
+    const end = (error) => {
+      if (ws.readyState !== 1) return;
+      sendText(ws, { error });
+      ws.close(1000);
+    };
+    const signInTimer = setTimeout(() => end('no sign in in time'), askSignIn);
+    const lifeTimer = setTimeout(() => end('time is up'), askLife);
+    ws.on('message', (data, isBinary) => {
+      if (isBinary) {
+        const r = a.r;
+        if (!r || !r.pc || r.pc.readyState !== 1 || !fits(data, 'ask on', r.id)) return;
+        r.pc.send(R.frame(a.ch, data));
+        return;
+      }
+      const m = R.parseAsk(data);
+      if (!m) return;
+      if (m.ping) return sendText(ws, { pong: 1 });
+      if (!a.sub) {
+        if (!m.code || a.checking) return;
+        a.checking = true;
+        exchange(m.code, m.verifier).then(
+          ({ sub, email }) => {
+            if (ws.readyState !== 1) return;
+            clearTimeout(signInTimer);
+            a.sub = sub;
+            a.email = email;
+            sendText(ws, { machines: machinesOf(sub), email });
+          },
+          (err) => end(err instanceof AuthError ? err.message : 'cannot sign in'),
+        );
+        return;
+      }
+      if (m.list) return sendText(ws, { machines: machinesOf(a.sub), email: a.email });
+      if (m.ask) return openAsk(a, m.ask);
+    });
+    ws.on('close', () => {
+      clearTimeout(signInTimer);
+      clearTimeout(lifeTimer);
+      closeAsk(a);
+      release();
     });
     ws.on('error', () => {});
   }
@@ -471,6 +666,7 @@ function createRelay(options = {}) {
           then(ws);
         });
       const name = R.cleanName(url.searchParams.get('name'));
+      const takesAsks = url.searchParams.get('asks') === '1';
       const canRefresh = req.headers['x-horadric-refresh'] === '1';
       const id = R.pcId(secret);
       if (token === null) return upgrade((ws) => onPc(ws, id, null, name));
@@ -482,7 +678,7 @@ function createRelay(options = {}) {
           if (!makeRoomFor(claims.sub, id)) return upgrade((ws) => ws.close(CLOSE_TOO_MANY, 'too many machines'));
           const first = seen.get(claims.sub)?.get(id);
           const isExempt = R.exempt(canRefresh, first?.at, legacyBefore);
-          upgrade((ws) => onPc(ws, id, claims.sub, name, { exp: claims.exp, exempt: isExempt }));
+          upgrade((ws) => onPc(ws, id, claims.sub, name, { exp: claims.exp, exempt: isExempt }, takesAsks));
         },
         (err) => {
           if (socket.destroyed) return release();
@@ -497,6 +693,21 @@ function createRelay(options = {}) {
       const r = rooms.get(id);
       if (r && r.phones.size >= R.MAX_PHONES) return reject(socket, 429);
       wss.handleUpgrade(req, socket, head, (ws) => onPhone(ws, id));
+    } else if (url.pathname === '/ask') {
+      const ip = R.clientIp(req.headers, req.socket.remoteAddress, trustProxy);
+      const n = askIps.get(ip) || 0;
+      if (n >= MAX_ASKS_PER_IP) return reject(socket, 429);
+      askIps.set(ip, n + 1);
+      let held = true;
+      const release = () => {
+        if (!held) return;
+        held = false;
+        const left = (askIps.get(ip) || 1) - 1;
+        if (left > 0) askIps.set(ip, left);
+        else askIps.delete(ip);
+      };
+      socket.once('close', release);
+      wss.handleUpgrade(req, socket, head, (ws) => onAsk(ws, release));
     } else {
       reject(socket, 404);
     }
@@ -526,7 +737,7 @@ function createRelay(options = {}) {
   return server;
 }
 
-module.exports = { createRelay, CLOSE_BAD_TOKEN, CLOSE_AUTH_DOWN, CLOSE_TOO_MANY };
+module.exports = { createRelay, CLOSE_BAD_TOKEN, CLOSE_AUTH_DOWN, CLOSE_TOO_MANY, MAX_ASKS_PER_IP };
 
 if (require.main === module) {
   const PORT = Number(process.env.PORT) || 43200;
