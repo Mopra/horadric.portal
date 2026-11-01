@@ -39,6 +39,20 @@ before, and `name` is ignored. A signed in PC that can hand the relay a
 fresh token on the open socket says so with `X-Horadric-Refresh: 1` (see
 Fresh tokens below).
 
+### Teams
+
+A login that is a member of a WorkOS organization carries its id in the
+token's `org_id` claim. A signed in PC that knows teams adds `team=1` to
+the address. Between two such PCs signed in as two people of one
+organization, the relay lists each to the other and routes joins between
+them as for one person's PCs, marking the other `"kin":"team"` in the
+`brothers` entry and on the `join` and `link` frames. A PC that does not
+dial with `team=1` is never told of a teammate nor told to one: a Horadric
+from before teams would take a teammate's machine for its human's own.
+At most 64 teammates' machines are listed to one PC. A fresh token whose
+organization changed, or that has none now, moves the PC: lists go out
+again and its channels to machines no longer its teammates close.
+
 Horadric 0.32 and older send `/pc?secret=..&token=..&name=..` instead.
 The relay takes that until 2027-01-01 (`QUERY_UNTIL` in `relay.js`), and
 only when no `X-Horadric-Secret` header came; after it, such a PC is
@@ -119,10 +133,12 @@ relay checks expiries in one sweep every 10 seconds.
 Relay to a signed in PC, text:
 
 - `{"brothers":[{"id":"<pc id>","name":"<name>"}]}`: the user's other
-  connected PCs, sorted by id. Sent on connect and whenever one comes,
+  connected PCs, sorted by id, then teammates' PCs (see Teams), each with
+  `"kin":"team"`. Sent on connect and whenever one comes,
   goes or reconnects. `id` is the 32 hex PC id, as a phone knows it.
 - `{"join":<ch>,"id":"<pc id>","name":"<name>"}`: a brother asks to join
-  and the relay opened channel `<ch>` to it.
+  and the relay opened channel `<ch>` to it. `"kin":"team"` when it is a
+  teammate's PC, here and on `link`.
 - `{"link":<ch>,"id":"<pc id>","name":"<name>"}`: the answer to this PC's
   own join request, the channel on its side.
 - `{"close":<ch>}`: the other end closed the channel or went away.

@@ -100,6 +100,28 @@ function brothersOf(pcs, self) {
     .sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
 }
 
+// The most teammates' machines one PC is told of, so a big organization
+// does not make every list as long as it is.
+const MAX_MATES = 64;
+
+// What one PC is told: its user's other PCs, then the machines of its
+// teammates (other people of its WorkOS organization) marked
+// "kin":"team", the first MAX_MATES by id. A PC that does not know teams
+// never gets here with any mates.
+function listFor(own, mates, self) {
+  const team = brothersOf(mates, self)
+    .slice(0, MAX_MATES)
+    .map((b) => ({ ...b, kin: 'team' }));
+  return brothersOf(own, self).concat(team);
+}
+
+// The WorkOS organization a token was minted for, if any. AuthKit puts it
+// in `org_id` when the login is a member of one.
+function orgOf(claims) {
+  const org = claims && claims.org_id;
+  return typeof org === 'string' && org.length > 0 && org.length <= 128 ? org : null;
+}
+
 // Text control from a PC: a ping, a join request, a link closed or a fresh
 // token. Anything else is dropped, as before.
 function parseControl(data) {
@@ -322,6 +344,9 @@ module.exports = {
   isPing,
   cleanName,
   brothersOf,
+  listFor,
+  orgOf,
+  MAX_MATES,
   parseControl,
   parseAsk,
   isId,

@@ -831,3 +831,91 @@ test('the state file goes through a fresh temp file, and holds only so many user
   assert.deepStrictEqual([...seen.keys()].sort(), ['user_2', 'user_3']);
   fs.rmSync(dir, { recursive: true, force: true });
 });
+
+// How a Horadric that knows teams dials: team=1 beside its name.
+const teamPcUrl = (base, secret, token, name) => {
+  const d = pcUrl(base, secret, token, name);
+  return { ...d, url: d.url + (d.url.includes('?') ? '&' : '?') + 'team=1' };
+};
+
+const four = 's'.repeat(20) + '4';
+const five = 's'.repeat(20) + '5';
+const idOf = (s) => R.pcId(s);
+const sorted = (list) => list.slice().sort((a, b) => (a.id < b.id ? -1 : 1));
+
+test('teammates are listed and joined only between machines that know teams', async () => {
+  const r = await relay();
+  try {
+    const org = { org_id: 'org_1' };
+    const ann = connect(teamPcUrl(r.base, secrets.one, sign(keyA, claimsFor('ann', org)), 'Ann'));
+    assert.deepStrictEqual(await ann.next(), { brothers: [] });
+    const bob = connect(teamPcUrl(r.base, secrets.two, sign(keyA, claimsFor('bob', org)), 'Bob'));
+    assert.deepStrictEqual(await bob.next(), { brothers: [{ id: idOf(secrets.one), name: 'Ann', kin: 'team' }] });
+    assert.deepStrictEqual(await ann.next(), { brothers: [{ id: idOf(secrets.two), name: 'Bob', kin: 'team' }] });
+
+    // A Horadric before teams in the same organization sees no teammate
+    // and is seen by none, so it never takes one for its human's own.
+    const old = connect(pcUrl(r.base, secrets.three, sign(keyA, claimsFor('cid', org)), 'Old'));
+    assert.deepStrictEqual(await old.next(), { brothers: [] });
+    old.send(JSON.stringify({ join: { to: idOf(secrets.one) } }));
+    assert.deepStrictEqual(await old.next(), { error: 'no such brother', to: idOf(secrets.one) });
+    // Another organization's machine neither.
+    const other = connect(teamPcUrl(r.base, four, sign(keyA, claimsFor('dan', { org_id: 'org_2' })), 'Dan'));
+    assert.deepStrictEqual(await other.next(), { brothers: [] });
+
+    // Bob's own second machine: plain to Bob, a teammate's to Ann.
+    const bob2 = connect(teamPcUrl(r.base, five, sign(keyA, claimsFor('bob', org)), 'Bob 2'));
+    assert.deepStrictEqual(
+      await bob2.next(),
+      { brothers: [{ id: idOf(secrets.two), name: 'Bob' }, { id: idOf(secrets.one), name: 'Ann', kin: 'team' }] },
+    );
+    assert.deepStrictEqual((await bob.next()).brothers[0], { id: idOf(five), name: 'Bob 2' });
+    assert.deepStrictEqual(
+      sorted((await ann.next()).brothers),
+      sorted([{ id: idOf(secrets.two), name: 'Bob', kin: 'team' }, { id: idOf(five), name: 'Bob 2', kin: 'team' }]),
+    );
+
+    // A join between teammates says so on both sides.
+    ann.send(JSON.stringify({ join: { to: idOf(secrets.two) } }));
+    const asked = await bob.next();
+    assert.deepStrictEqual(asked, { join: asked.join, id: idOf(secrets.one), name: 'Ann', kin: 'team' });
+    const link = await ann.next();
+    assert.deepStrictEqual(link, { link: link.link, id: idOf(secrets.two), name: 'Bob', kin: 'team' });
+    // Between one person's own machines it does not.
+    bob.send(JSON.stringify({ join: { to: idOf(five) } }));
+    const own = await bob2.next();
+    assert.strictEqual(own.kin, undefined);
+    assert.strictEqual((await bob.next()).kin, undefined);
+
+    // Ann's token refreshed without the organization: she is no one's
+    // teammate now, and her channel to Bob closes.
+    ann.send(JSON.stringify({ token: sign(keyA, claimsFor('ann')) }));
+    const told = new Map();
+    for (let i = 0; i < 2; i++) {
+      const m = await bob.next();
+      told.set(Object.keys(m)[0], m);
+    }
+    assert.deepStrictEqual(told.get('close'), { close: asked.join });
+    assert.deepStrictEqual(told.get('brothers'), { brothers: [{ id: idOf(five), name: 'Bob 2' }] });
+    const annSaw = [];
+    for (let i = 0; i < 2; i++) annSaw.push(await ann.next());
+    assert.ok(annSaw.some((m) => m.brothers && m.brothers.length === 0));
+    assert.ok(annSaw.some((m) => m.token === 'ok'));
+
+    for (const ws of [ann, bob, bob2, old, other]) ws.close();
+  } finally {
+    await r.close();
+  }
+});
+
+test('the organization comes only from a sane org_id claim, and lists stay bounded', () => {
+  assert.strictEqual(R.orgOf({ org_id: 'org_1' }), 'org_1');
+  assert.strictEqual(R.orgOf({}), null);
+  assert.strictEqual(R.orgOf({ org_id: 7 }), null);
+  assert.strictEqual(R.orgOf({ org_id: 'x'.repeat(200) }), null);
+  const pcs = Array.from({ length: R.MAX_MATES + 10 }, (_, i) => ({ id: String(i).padStart(4, '0'), name: 'm' }));
+  const list = R.listFor([{ id: 'own', name: 'Me' }, { id: 'zz', name: 'Desk' }], pcs, 'own');
+  assert.deepStrictEqual(list[0], { id: 'zz', name: 'Desk' });
+  assert.strictEqual(list.length, 1 + R.MAX_MATES);
+  assert.ok(list.slice(1).every((b) => b.kin === 'team'));
+});

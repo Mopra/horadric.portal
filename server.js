@@ -156,8 +156,13 @@ function createRelay(options = {}) {
   const authorizeUrl = options.authorizeUrl || WORKOS_AUTHORIZE;
 
   // id -> { id, pc, phones: Map<ch, ws>, links: Map<ch, { peer, ch }>,
-  // asks: Map<ch, ask>, takesAsks, last, user, name }
+  // asks: Map<ch, ask>, takesAsks, last, user, name, org, teams }
   const rooms = new Map();
+  // WorkOS organization -> Set of ids of its connected PCs that know
+  // teams (dialled with team=1). Only those are ever told of teammates or
+  // told to them: an older Horadric would take a teammate's machine for
+  // its human's own and give it every right.
+  const orgs = new Map();
   // WorkOS user (sub) -> Set of ids of that user's connected PCs.
   const users = new Map();
   // WorkOS user (sub) -> Map of id -> when the relay first saw it, at most
@@ -320,7 +325,7 @@ function createRelay(options = {}) {
   function room(id) {
     let r = rooms.get(id);
     if (!r) {
-      r = { id, pc: null, phones: new Map(), links: new Map(), asks: new Map(), takesAsks: false, last: 0, user: null, name: 'PC' };
+      r = { id, pc: null, phones: new Map(), links: new Map(), asks: new Map(), takesAsks: false, last: 0, user: null, name: 'PC', org: null, teams: false };
       rooms.set(id, r);
     }
     return r;
@@ -335,23 +340,68 @@ function createRelay(options = {}) {
   // channel always says which of the two it is.
   const taken = (r) => ({ has: (ch) => r.phones.has(ch) || r.links.has(ch) || r.asks.has(ch) });
 
-  function tellBrothers(sub) {
-    const ids = users.get(sub);
-    if (!ids) return;
-    const pcs = [...ids].map((id) => rooms.get(id));
-    for (const r of pcs) sendText(r.pc, { brothers: R.brothersOf(pcs, r.id) });
+  const roomsOf = (ids) => [...(ids || [])].map((id) => rooms.get(id)).filter(Boolean);
+
+  // Whether r and t are teammates' machines: both know teams, and are
+  // signed in as two people of one organization.
+  function mates(r, t) {
+    return !!(r.teams && t.teams && r.org && r.org === t.org && r.user && t.user && r.user !== t.user);
+  }
+
+  function listOf(r) {
+    const own = roomsOf(users.get(r.user));
+    const team = r.teams && r.org ? roomsOf(orgs.get(r.org)).filter((t) => mates(r, t)) : [];
+    return R.listFor(own, team, r.id);
+  }
+
+  // Tells every PC of user sub, and every PC of organization org that
+  // knows teams, its list again: one of them came, went or moved.
+  function tellBrothers(sub, org = null) {
+    const told = new Set(roomsOf(users.get(sub)));
+    for (const t of roomsOf(org && orgs.get(org))) told.add(t);
+    for (const r of told) if (r.pc && r.user) sendText(r.pc, { brothers: listOf(r) });
+  }
+
+  function joinOrg(r, org) {
+    r.org = org;
+    if (!org || !r.teams) return;
+    if (!orgs.has(org)) orgs.set(org, new Set());
+    orgs.get(org).add(r.id);
+  }
+
+  function leaveOrg(r) {
+    const org = r.org;
+    r.org = null;
+    const ids = org && orgs.get(org);
+    if (ids) {
+      ids.delete(r.id);
+      if (ids.size === 0) orgs.delete(org);
+    }
+    return org;
   }
 
   function leaveUser(r) {
     if (!r.user) return;
     const sub = r.user;
     r.user = null;
+    const org = leaveOrg(r);
     const ids = users.get(sub);
     if (ids) {
       ids.delete(r.id);
       if (ids.size === 0) users.delete(sub);
     }
-    tellBrothers(sub);
+    tellBrothers(sub, org);
+  }
+
+  // A token refreshed for another organization, or none: the PC's
+  // teammates change, and a channel to one it no longer has closes.
+  function moveOrg(r, org) {
+    if (org === r.org) return;
+    const was = leaveOrg(r);
+    joinOrg(r, org);
+    for (const [ch, l] of [...r.links]) if (l.peer.user !== r.user && !mates(r, l.peer)) closeLink(r, ch);
+    tellBrothers(r.user, was);
+    if (org) tellBrothers(r.user, org);
   }
 
   function closeLink(r, ch) {
@@ -370,7 +420,8 @@ function createRelay(options = {}) {
     const fail = (error) => sendText(r.pc, { error, to });
     if (!r.user) return fail('not signed in');
     const t = rooms.get(to);
-    if (!t || t === r || !t.pc || t.user !== r.user) return fail('no such brother');
+    const mate = !!t && mates(r, t);
+    if (!t || t === r || !t.pc || (t.user !== r.user && !mate)) return fail('no such brother');
     if (r.links.size >= R.MAX_LINKS || t.links.size >= R.MAX_LINKS) return fail('too many links');
     const mine = R.nextChannel(r.last, taken(r));
     r.last = mine;
@@ -378,8 +429,9 @@ function createRelay(options = {}) {
     t.last = theirs;
     r.links.set(mine, { peer: t, ch: theirs });
     t.links.set(theirs, { peer: r, ch: mine });
-    sendText(t.pc, { join: theirs, id: r.id, name: r.name });
-    sendText(r.pc, { link: mine, id: t.id, name: t.name });
+    const kin = mate ? { kin: 'team' } : {};
+    sendText(t.pc, { join: theirs, id: r.id, name: r.name, ...kin });
+    sendText(r.pc, { link: mine, id: t.id, name: t.name, ...kin });
   }
 
   // Past MAX_FRAME a frame is dropped and the socket kept, so one too large
@@ -403,6 +455,7 @@ function createRelay(options = {}) {
         if (claims.sub !== r.user) return sendText(ws, { token: 'refused', why: 'another user' });
         ws.exp = claims.exp;
         sawUser(r.user);
+        moveOrg(r, R.orgOf(claims));
         sendText(ws, { token: 'ok', exp: claims.exp });
       },
       (err) => {
@@ -428,7 +481,7 @@ function createRelay(options = {}) {
     }
   }
 
-  function onPc(ws, id, user, name, auth, takesAsks = false) {
+  function onPc(ws, id, user, name, auth, takesAsks = false, team = { org: null, knows: false }) {
     const r = room(id);
     // A second connection with the same id is the PC reconnecting. Its
     // brother channels die with the old socket, as phone sessions would,
@@ -438,7 +491,9 @@ function createRelay(options = {}) {
       dropAsks(r);
       r.pc.terminate();
     }
-    if (r.user !== user) leaveUser(r);
+    // Leaving first even as the same user, so the organization the old
+    // socket was in is left too, and the list goes out once below.
+    if (r.user !== user || r.org !== team.org || r.teams !== team.knows) leaveUser(r);
     r.pc = ws;
     r.name = name;
     r.takesAsks = takesAsks;
@@ -453,7 +508,9 @@ function createRelay(options = {}) {
       r.user = user;
       if (!users.has(user)) users.set(user, new Set());
       users.get(user).add(id);
-      tellBrothers(user);
+      r.teams = team.knows;
+      joinOrg(r, team.org);
+      tellBrothers(user, r.teams ? r.org : null);
     }
     ws.on('message', (data, isBinary) => {
       if (!isBinary) {
@@ -667,6 +724,7 @@ function createRelay(options = {}) {
         });
       const name = R.cleanName(url.searchParams.get('name'));
       const takesAsks = url.searchParams.get('asks') === '1';
+      const knowsTeams = url.searchParams.get('team') === '1';
       const canRefresh = req.headers['x-horadric-refresh'] === '1';
       const id = R.pcId(secret);
       if (token === null) return upgrade((ws) => onPc(ws, id, null, name));
@@ -678,7 +736,8 @@ function createRelay(options = {}) {
           if (!makeRoomFor(claims.sub, id)) return upgrade((ws) => ws.close(CLOSE_TOO_MANY, 'too many machines'));
           const first = seen.get(claims.sub)?.get(id);
           const isExempt = R.exempt(canRefresh, first?.at, legacyBefore);
-          upgrade((ws) => onPc(ws, id, claims.sub, name, { exp: claims.exp, exempt: isExempt }, takesAsks));
+          const team = { org: R.orgOf(claims), knows: knowsTeams };
+          upgrade((ws) => onPc(ws, id, claims.sub, name, { exp: claims.exp, exempt: isExempt }, takesAsks, team));
         },
         (err) => {
           if (socket.destroyed) return release();
